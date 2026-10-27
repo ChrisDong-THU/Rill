@@ -37,9 +37,9 @@ flowchart LR
 
 配置读取和适配在单独 I/O 线程完成，失败时保留上次可用结果。`ConfigFiles` 对每个文件使用 `AtomicFile`，中断写入回滚该文件；两个文件不构成跨文件事务。改动配置提交逻辑时，应保持该边界明确。
 
-## 兼容性
+## 运行约定
 
-保留包名 `app.rill.android`、Manifest 组件名、Provider authority、`rill` SharedPreferences 及现有设置键。配置路径为 `source.yaml`、`adapted.yaml`、`shared/`，诊断为 `relay-result.json`。
+包名为 `app.rill.android`，设置存于 `rill` SharedPreferences。配置路径为 `source.yaml`、`adapted.yaml`、`shared/`，诊断为 `relay-result.json`。
 
 最低 API 26，compileSdk / targetSdk 34。版本只在根目录 `gradle.properties` 修改，诊断使用 `BuildConfig.VERSION_NAME`；健康检查返回稳定的 `Rill ready`。
 

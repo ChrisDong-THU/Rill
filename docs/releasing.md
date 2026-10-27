@@ -4,7 +4,7 @@
 
 版本来源为根目录 `gradle.properties`。正式版使用 `x.y.z`，每次发布都增加 `rillVersionCode`，并更新 [CHANGELOG](../CHANGELOG.md)。Git 标签为 `v<版本>`。
 
-0.3.5 起沿用同一份正式签名。证书 SHA-256：
+正式包使用独立发布签名。证书 SHA-256：
 
 ```text
 5f3d35c836f1b7c2c5bc14a6e7ecac6b9ce74fb6c83d2427998012d822b57840
@@ -31,7 +31,7 @@
    .\gradlew.bat :app:connectedDebugAndroidTest
    ```
 
-3. 对涉及取流的改动执行 [后台测试](background-testing.md)，记录环境、结果和未覆盖范围。正式包另验证旧正式版覆盖安装、后台取流和启停。
+3. 对涉及取流的改动执行 [后台测试](background-testing.md)，记录环境、结果和未覆盖范围。正式包另验证安装、后台取流和启停。
 4. 提交已验证的源码，重新构建正式包，使包内版本控制信息对应发布提交：
 
    ```powershell
@@ -63,4 +63,4 @@ gh release view v<版本>
 gh release edit v<版本> --draft=false --latest
 ```
 
-发布说明应包括用户可见改动、升级兼容性、验证结果及实际测试边界。正式版不勾选 prerelease。发布后确认 Release 指向预期提交，下载附件并核对 SHA-256。
+发布说明应包括用户可见改动、已验证使用场景、测试结果及实际测试边界。正式版不勾选 prerelease。发布后确认 Release 指向预期提交，下载附件并核对 SHA-256。
