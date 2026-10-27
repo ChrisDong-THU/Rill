@@ -1,0 +1,40 @@
+plugins {
+    id 'com.android.application' version '8.7.3' apply false
+}
+
+configurations {
+    javaFormatter
+}
+
+dependencies {
+    javaFormatter('com.google.googlejavaformat:google-java-format:1.24.0:all-deps') {
+        transitive = false
+    }
+}
+
+def javaSources = fileTree('app/src') { include '**/*.java' } +
+        fileTree('core/src') { include '**/*.java' }
+
+def formatterExports = ['api', 'file', 'parser', 'tree', 'util', 'code'].collect {
+    "--add-exports=jdk.compiler/com.sun.tools.javac.${it}=ALL-UNNAMED"
+}
+
+tasks.register('formatJava', JavaExec) {
+    group = 'formatting'
+    description = 'Format Java sources using Google Java Format.'
+    classpath = configurations.javaFormatter
+    mainClass = 'com.google.googlejavaformat.java.Main'
+    jvmArgs formatterExports
+    args '--replace'
+    args javaSources.files.sort()
+}
+
+tasks.register('checkJavaFormat', JavaExec) {
+    group = 'verification'
+    description = 'Check Java formatting without changing files.'
+    classpath = configurations.javaFormatter
+    mainClass = 'com.google.googlejavaformat.java.Main'
+    jvmArgs formatterExports
+    args '--dry-run', '--set-exit-if-changed'
+    args javaSources.files.sort()
+}

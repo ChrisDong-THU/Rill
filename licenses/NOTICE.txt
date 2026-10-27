@@ -1,0 +1,3 @@
+Rill includes SnakeYAML 2.4, Copyright SnakeYAML developers, Apache License 2.0.
+Source: https://bitbucket.org/snakeyaml/snakeyaml
+UI interaction reference: https://github.com/carlelieser/shizzi (no source or assets copied).

@@ -1,0 +1,89 @@
+plugins {
+    id 'com.android.application'
+}
+
+def signingProperties = new Properties()
+def signingPropertiesFile = rootProject.file('keystore.properties')
+if (signingPropertiesFile.isFile()) {
+    signingPropertiesFile.withReader('UTF-8') { signingProperties.load(it) }
+}
+def releaseSigning = [
+    storeFile: providers.environmentVariable('RILL_KEYSTORE_PATH').orNull ?: signingProperties.getProperty('storeFile'),
+    storePassword: providers.environmentVariable('RILL_KEYSTORE_PASSWORD').orNull ?: signingProperties.getProperty('storePassword'),
+    keyAlias: providers.environmentVariable('RILL_KEY_ALIAS').orNull ?: signingProperties.getProperty('keyAlias'),
+    keyPassword: providers.environmentVariable('RILL_KEY_PASSWORD').orNull ?: signingProperties.getProperty('keyPassword')
+]
+def hasReleaseSigning = releaseSigning.values().every { it != null && !it.isEmpty() }
+
+android {
+    namespace 'app.rill.android'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'app.rill.android'
+        minSdk 26
+        targetSdk 34
+        versionCode providers.gradleProperty('rillVersionCode').get().toInteger()
+        versionName providers.gradleProperty('rillVersionName').get()
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            release {
+                storeFile rootProject.file(releaseSigning.storeFile)
+                storePassword releaseSigning.storePassword
+                keyAlias releaseSigning.keyAlias
+                keyPassword releaseSigning.keyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            debuggable false
+            if (hasReleaseSigning) signingConfig signingConfigs.release
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    // Keep one canonical copy of third-party notices and package it with the app.
+    sourceSets.main.assets.srcDir rootProject.file('licenses')
+}
+
+def verifyReleaseSigning = tasks.register('verifyReleaseSigning') {
+    group = 'verification'
+    description = 'Require a local release key before producing release artifacts.'
+    doLast {
+        if (!hasReleaseSigning) {
+            throw new GradleException('Release signing is missing. Configure keystore.properties or the RILL_KEYSTORE_* / RILL_KEY_* environment variables; see docs/releasing.md.')
+        }
+        if (!rootProject.file(releaseSigning.storeFile).isFile()) {
+            throw new GradleException('The configured release keystore file does not exist.')
+        }
+    }
+}
+
+tasks.configureEach {
+    if (name in ['validateSigningRelease', 'packageRelease', 'signReleaseBundle']) {
+        dependsOn verifyReleaseSigning
+    }
+}
+
+dependencies {
+    implementation project(':core')
+    androidTestImplementation 'androidx.test:runner:1.6.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}

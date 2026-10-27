@@ -1,0 +1,26 @@
+# Local tools, SDK settings and IDE state
+.local/
+.gradle/
+.idea/
+*.iml
+local.properties
+
+# Generated outputs
+**/build/
+*.apk
+*.aab
+*.idsig
+*.class
+*.hprof
+__pycache__/
+*.pyc
+
+# Signing material and private configuration exports
+*.jks
+*.keystore
+*.p12
+*.pfx
+keystore.properties
+Rill-Clash.yaml
+.DS_Store
+Thumbs.db
