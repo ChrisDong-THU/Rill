@@ -11,15 +11,22 @@ import android.os.Build;
 import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
 import android.service.notification.StatusBarNotification;
+import android.util.Log;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 import app.rill.core.RelayCore;
+import app.rill.core.Targets;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.InputStream;
+import java.lang.reflect.Field;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
+import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.After;
 import org.junit.Assume;
@@ -92,11 +99,12 @@ public class RelayServiceTest {
         5000);
     SystemClock.sleep(2500);
     JSONObject report = new JSONObject(service.report());
-    assertTrue(report.getJSONObject("background").getBoolean("cpu_lock_held"));
+    assertFalse(report.getJSONObject("background").getBoolean("cpu_lock_held"));
     assertTrue(report.getJSONObject("wifi").getBoolean("request_active"));
     assertTrue(report.getLong("service_tick_age_ms") < 2500);
     assertEquals(first.when, notification().when);
     assertTrue(health().startsWith("HTTP/1.1 200"));
+    assertFalse(background(service).getBoolean("cpu_lock_held"));
     context.startService(new Intent(context, RelayService.class).setAction(RelayService.STOP));
     await(() -> RelayService.instance == null, 5000);
     await(() -> service.core == null || !service.core.isListening(), 5000);
@@ -105,6 +113,118 @@ public class RelayServiceTest {
     assertFalse(
         new JSONObject(service.report()).getJSONObject("wifi").getBoolean("request_active"));
     assertNull(notification());
+  }
+
+  @Test
+  public void relayRequestAcquiresWakeLockBeforePreflightAndKeepsIdleGrace() throws Exception {
+    RelayService service = startInBackground();
+    await(() -> service.core != null && service.core.isListening(), 5000);
+    await(
+        () -> new JSONObject(service.report()).getJSONObject("wifi").getBoolean("available"),
+        20000);
+    try (ServerSocket origin = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"));
+        Socket player = new Socket("127.0.0.1", RelayCore.PORT)) {
+      origin.setSoTimeout(6000);
+      player.setSoTimeout(6000);
+      String url = "http://127.0.0.1:" + origin.getLocalPort();
+      service.core.setTargets(Targets.parse(url));
+      player
+          .getOutputStream()
+          .write(("GET " + url + "/audio HTTP/1.1\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+      try (Socket upstream = origin.accept()) {
+        assertTrue(background(service).getBoolean("cpu_lock_held"));
+        assertEquals(1, background(service).getInt("requests_in_flight"));
+        upstream
+            .getOutputStream()
+            .write(
+                ("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/4\r\n"
+                        + "Content-Length: 4\r\nConnection: close\r\n\r\ntest")
+                    .getBytes(StandardCharsets.US_ASCII));
+        assertTrue(read(player.getInputStream()).endsWith("\r\n\r\ntest"));
+      }
+      await(() -> background(service).getInt("requests_in_flight") == 0, 5000);
+      assertTrue(background(service).getBoolean("cpu_lock_held"));
+    }
+    context.startService(new Intent(context, RelayService.class).setAction(RelayService.STOP));
+    await(() -> RelayService.instance == null, 5000);
+    assertFalse(background(service).getBoolean("cpu_lock_held"));
+  }
+
+  private static JSONObject background(RelayService service) throws Exception {
+    return new JSONObject(service.report()).getJSONObject("background");
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  public void periodicSnapshotKeepsRecentHistoryWhenSessionIsFull() throws Exception {
+    RelayService service = startInBackground();
+    await(() -> service.core != null && service.core.isListening(), 5000);
+    JSONObject power = background(service);
+    long startedAt = new JSONObject(service.report()).getLong("started_at_ms");
+    Field field = RelayService.class.getDeclaredField("samples");
+    field.setAccessible(true);
+    ArrayDeque<JSONObject> samples = (ArrayDeque<JSONObject>) field.get(service);
+    long seededAt = System.currentTimeMillis();
+    // Seed 150 minutes of history without changing the production sampling clock.
+    synchronized (samples) {
+      samples.clear();
+      for (int i = 0; i < 900; i++) {
+        samples.add(
+            new JSONObject()
+                .put("time_ms", seededAt - (900L - i) * 10000)
+                .put("downloaded_bytes", i * 18000000L)
+                .put("served_bytes", i * 17900000L)
+                .put("active_players", 1)
+                .put("upstream_connections", 4)
+                .put("retries", 0)
+                .put("errors", 0)
+                .put("background", power));
+      }
+    }
+    for (int i = 0; i < 200; i++) service.log("long-session fixture event " + i);
+    File path = new File(context.getFilesDir(), "relay-result.json");
+    await(
+        () -> {
+          JSONObject report = savedReport(path);
+          if (report.optLong("started_at_ms") != startedAt) return false;
+          JSONArray events = report.optJSONArray("events");
+          if (events == null || events.length() == 0) return false;
+          return events.toString().contains("long-session fixture event 199");
+        },
+        18000);
+    JSONObject snapshot = savedReport(path);
+    JSONArray recent = snapshot.getJSONArray("samples");
+    Log.i(
+        "RillTest",
+        "Long-session periodic snapshot bytes="
+            + path.length()
+            + " samples="
+            + recent.length()
+            + " events="
+            + snapshot.getJSONArray("events").length());
+    assertEquals(24, recent.length());
+    assertEquals(60, snapshot.getJSONArray("events").length());
+    assertTrue(recent.getJSONObject(0).getLong("time_ms") >= seededAt - 24 * 10000L);
+    assertTrue(recent.getJSONObject(recent.length() - 1).getLong("time_ms") >= seededAt);
+    JSONObject full = new JSONObject(service.report());
+    assertEquals(900, full.getJSONArray("samples").length());
+    assertEquals(200, full.getJSONArray("events").length());
+    context.startService(new Intent(context, RelayService.class).setAction(RelayService.STOP));
+    await(
+        () -> {
+          JSONArray archive = savedReport(path).optJSONArray("samples");
+          return archive != null && archive.length() == 900;
+        },
+        5000);
+    assertEquals(200, savedReport(path).getJSONArray("events").length());
+  }
+
+  private static JSONObject savedReport(File path) {
+    try (FileInputStream stream = new FileInputStream(path)) {
+      return new JSONObject(read(stream));
+    } catch (Exception ignored) {
+      return new JSONObject();
+    }
   }
 
   @Test

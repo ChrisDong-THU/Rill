@@ -3,8 +3,10 @@ package app.rill.android;
 import static org.junit.Assert.*;
 
 import androidx.test.platform.app.InstrumentationRegistry;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import org.junit.Test;
 
@@ -26,10 +28,15 @@ public class ConfigFilesTest {
         Thread.interrupted();
       }
       assertEquals("rules: []", files.readSource());
-      assertEquals("rules: [MATCH,DIRECT]", files.readAdapted());
+      assertTrue(files.hasAdapted());
+      ByteArrayOutputStream output = new ByteArrayOutputStream();
+      files.copyAdapted(output);
+      assertArrayEquals(
+          "rules: [MATCH,DIRECT]".getBytes(StandardCharsets.UTF_8), output.toByteArray());
       files.clear();
       assertFalse(files.hasSource());
-      assertThrows(IOException.class, files::readAdapted);
+      assertFalse(files.hasAdapted());
+      assertThrows(IOException.class, () -> files.copyAdapted(output));
     } finally {
       files.clear();
       assertTrue(directory.delete());

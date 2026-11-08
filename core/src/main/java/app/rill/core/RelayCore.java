@@ -22,6 +22,7 @@ import java.net.SocketException;
 import java.net.URL;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -51,10 +52,19 @@ public final class RelayCore implements Closeable {
 
   public interface Events {
     void event(String message);
+
+    default void requestStarted() {}
+
+    default void requestFinished() {}
   }
 
   public static final String HOST = "lgf.audio.tidal.com";
   public static final int PORT = 18889, BLOCK = 256 * 1024, WINDOW = 12, MAX_BLOCKS = 48;
+  private static final int START_BUFFER = 512 * 1024;
+  // An unaligned START_BUFFER spans at most three blocks.
+  private static final int START_WINDOW = START_BUFFER / BLOCK + 1;
+  private static final int RECENT_BLOCKS = 4;
+  private static final Pattern CONTENT_RANGE = Pattern.compile("bytes (\\d+)-(\\d+)/(\\d+)");
   private final Opener opener;
   private final Events events;
   private final ThreadPoolExecutor fetchers =
@@ -78,9 +88,7 @@ public final class RelayCore implements Closeable {
   private final ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor();
   private final Set<HttpURLConnection> upstream =
       Collections.newSetFromMap(new ConcurrentHashMap<HttpURLConnection, Boolean>());
-  private final Set<Socket> sockets =
-      Collections.newSetFromMap(new ConcurrentHashMap<Socket, Boolean>());
-  private final Map<Socket, Long> activity = new ConcurrentHashMap<Socket, Long>();
+  private final Map<Socket, Client> clientsBySocket = new ConcurrentHashMap<>();
   private final LinkedHashMap<String, Job> jobs = new LinkedHashMap<String, Job>(4, .75f, true);
   // Guarded by jobs; reserve capacity before doing I/O, coalescing only identical URLs.
   private final Set<String> creating = new HashSet<>();
@@ -110,6 +118,7 @@ public final class RelayCore implements Closeable {
   public RelayCore(Opener opener, Events events) {
     this.opener = opener;
     this.events = events;
+    fetchers.allowCoreThreadTimeOut(true);
   }
 
   public RelayCore(Opener opener, Events events, int limit) {
@@ -125,16 +134,16 @@ public final class RelayCore implements Closeable {
     if (limit < 1 || limit > 16) throw new IllegalArgumentException("连接上限必须在 1–16 之间");
     synchronized (connectionGate) {
       connectionLimit = limit;
+      fetchers.setCorePoolSize(limit);
       connectionGate.notifyAll();
     }
-    fetchers.setCorePoolSize(limit);
   }
 
   private void reserveConnection() throws IOException {
     synchronized (connectionGate) {
       while (running && reservedConnections >= connectionLimit)
         try {
-          connectionGate.wait(1000);
+          connectionGate.wait();
         } catch (InterruptedException e) {
           Thread.currentThread().interrupt();
           throw new IOException("取流已取消");
@@ -174,26 +183,24 @@ public final class RelayCore implements Closeable {
               public void run() {
                 while (running)
                   try {
-                    final Socket s = server.accept();
-                    s.setSoTimeout(20000);
-                    s.setTcpNoDelay(true);
-                    sockets.add(s);
-                    activity.put(s, now());
+                    Socket s = server.accept();
+                    Client client = new Client(s);
                     try {
-                      clients.execute(
-                          new Runnable() {
-                            public void run() {
-                              handle(s);
-                            }
-                          });
-                    } catch (RejectedExecutionException e) {
+                      s.setSoTimeout(20000);
+                      s.setTcpNoDelay(true);
+                      clientsBySocket.put(s, client);
+                      if (!running) throw new SocketException();
+                      clients.execute(client);
+                    } catch (IOException | RejectedExecutionException e) {
                       quiet(s);
-                      sockets.remove(s);
-                      activity.remove(s);
+                      clientsBySocket.remove(s);
                     }
                   } catch (IOException e) {
                     if (running) {
                       running = false;
+                      synchronized (connectionGate) {
+                        connectionGate.notifyAll();
+                      }
                       log("监听失败，等待服务恢复");
                     }
                     break;
@@ -203,12 +210,12 @@ public final class RelayCore implements Closeable {
             "Rill-listener");
     listener.setDaemon(true);
     listener.start();
-    timer.scheduleAtFixedRate(
+    timer.scheduleWithFixedDelay(
         new Runnable() {
           public void run() {
             long t = now();
-            for (Map.Entry<Socket, Long> e : activity.entrySet())
-              if (t - e.getValue() > 60000) quiet(e.getKey());
+            for (Client client : clientsBySocket.values())
+              if (t - client.lastActivity > 60000) quiet(client.socket);
             synchronized (jobs) {
               Iterator<Job> it = jobs.values().iterator();
               while (it.hasNext()) {
@@ -233,8 +240,23 @@ public final class RelayCore implements Closeable {
     return u;
   }
 
-  private void handle(Socket socket) {
-    boolean sent = false;
+  private final class Client implements Runnable {
+    final Socket socket;
+    volatile long lastActivity = now();
+
+    Client(Socket socket) {
+      this.socket = socket;
+    }
+
+    @Override
+    public void run() {
+      handle(this);
+    }
+  }
+
+  private void handle(Client client) {
+    Socket socket = client.socket;
+    boolean sent = false, requestStarted = false;
     Job job = null;
     Reader reader = null;
     OutputStream out = null;
@@ -271,8 +293,10 @@ public final class RelayCore implements Closeable {
         return;
       }
       URL url = allowed(r.target, r.headers.getOrDefault("host", HOST));
+      requestStarted = true;
+      events.requestStarted();
       requests.incrementAndGet();
-      activity.put(socket, now());
+      client.lastActivity = now();
       job = acquire(url);
       format = job.format;
       String requestedRange = r.headers.get("range");
@@ -307,16 +331,16 @@ public final class RelayCore implements Closeable {
       // Do not commit successful response headers until upstream supplied validated bytes.
       reader.prefill();
       state = "正在加速 · " + job.id;
-      byte[] buffer = new byte[16384];
-      int n = reader.read(buffer);
+      byte[] buffer = new byte[(int) Math.min(64 * 1024, end - start + 1)];
+      int n = reader.read(buffer, 0);
       send(out, partial ? 206 : 200, partial ? "Partial Content" : "OK", h);
       sent = true;
       while (n != -1 && running) {
-        activity.put(socket, now());
+        client.lastActivity = now();
         out.write(buffer, 0, n);
         served.addAndGet(n);
-        activity.put(socket, now());
-        n = reader.read(buffer);
+        client.lastActivity = now();
+        n = reader.read(buffer, n);
       }
       out.flush();
     } catch (RangeException e) {
@@ -349,9 +373,9 @@ public final class RelayCore implements Closeable {
       }
       if (job != null) release(job);
       quiet(socket);
-      sockets.remove(socket);
-      activity.remove(socket);
+      clientsBySocket.remove(socket);
       if (active.get() == 0 && running) state = "等待播放 / 已缓存片段可复用";
+      if (requestStarted) events.requestFinished();
     }
   }
 
@@ -435,7 +459,15 @@ public final class RelayCore implements Closeable {
   }
 
   public int getOpenClientCount() {
-    return sockets.size();
+    return clientsBySocket.size();
+  }
+
+  public long getCachedBytes() {
+    synchronized (jobs) {
+      long bytes = 0;
+      for (Job job : jobs.values()) bytes += job.cachedBytes();
+      return bytes;
+    }
   }
 
   private Job createJob(URL url) throws IOException {
@@ -491,6 +523,7 @@ public final class RelayCore implements Closeable {
       c.disconnect();
       throw new IOException("服务已停止");
     }
+    int status = -1;
     try {
       c.setConnectTimeout(8000);
       c.setReadTimeout(10000);
@@ -501,11 +534,9 @@ public final class RelayCore implements Closeable {
       c.setRequestProperty("User-Agent", "stagefright/1.2 (Linux;Android 16)");
       if (tag != null && !tag.startsWith("W/")) c.setRequestProperty("If-Range", tag);
       else if (modified != null) c.setRequestProperty("If-Range", modified);
-      int status = c.getResponseCode();
+      status = c.getResponseCode();
       if (status != 206) throw new Fatal("上游 HTTP " + status + "，分段未获授权或未被接受");
-      Matcher m =
-          Pattern.compile("bytes (\\d+)-(\\d+)/(\\d+)")
-              .matcher(String.valueOf(c.getHeaderField("Content-Range")));
+      Matcher m = CONTENT_RANGE.matcher(String.valueOf(c.getHeaderField("Content-Range")));
       if (!m.matches()
           || Long.parseLong(m.group(1)) != first
           || Long.parseLong(m.group(2))
@@ -524,25 +555,28 @@ public final class RelayCore implements Closeable {
       if (tag == null && modified != null && !modified.equals(c.getHeaderField("Last-Modified")))
         throw new Fatal("音频版本已改变，已停止拼接");
       return c;
-    } catch (IOException e) {
-      disconnect(c);
-      throw e;
-    } catch (RuntimeException e) {
-      disconnect(c);
+    } catch (IOException | RuntimeException e) {
+      try {
+        // Android's disconnect cancels the call, while the caller owns the response body.
+        if (status >= 400) quiet(c.getErrorStream());
+        else if (status >= 0) quiet(c.getInputStream());
+      } catch (IOException | RuntimeException ignored) {
+        // Preserve the original transport or validation failure.
+      } finally {
+        disconnect(c);
+      }
+      if (e instanceof IOException) throw (IOException) e;
       throw new Fatal("上游响应头无效");
     }
   }
 
   private void disconnect(HttpURLConnection c) {
-    if (c != null) {
-      boolean removed = upstream.remove(c);
+    if (c != null && upstream.remove(c)) {
       try {
         c.disconnect();
       } finally {
-        if (removed) {
-          connections.decrementAndGet();
-          releaseConnection();
-        }
+        connections.decrementAndGet();
+        releaseConnection();
       }
     }
   }
@@ -553,13 +587,15 @@ public final class RelayCore implements Closeable {
     }
   }
 
-  static class Block {
+  private static final class Block {
+    final int length;
     byte[] data;
     int valid;
-    boolean busy, failed;
+    boolean used;
+    Runnable task;
 
-    Block(int n) {
-      data = new byte[n];
+    Block(int length) {
+      this.length = length;
     }
   }
 
@@ -567,7 +603,8 @@ public final class RelayCore implements Closeable {
     final URL url;
     final String id, etag, modified, format, contentType;
     final long size;
-    final LinkedHashMap<Integer, Block> blocks = new LinkedHashMap<Integer, Block>(64, .75f, true);
+    final LinkedHashMap<Integer, Block> blocks = new LinkedHashMap<>(16, .75f, true);
+    final Map<Integer, Integer> wanted = new LinkedHashMap<>();
     final List<Reader> readers = new ArrayList<Reader>();
     volatile boolean closed;
     volatile String failure;
@@ -585,11 +622,12 @@ public final class RelayCore implements Closeable {
         etag = c.getHeaderField("ETag");
         modified = c.getHeaderField("Last-Modified");
         byte[] prefix = new byte[(int) Math.min(size, 65536)];
-        InputStream in = c.getInputStream();
         int off = 0, n;
-        while (off < prefix.length && (n = in.read(prefix, off, prefix.length - off)) > 0) {
-          off += n;
-          downloaded.addAndGet(n);
+        try (InputStream in = c.getInputStream()) {
+          while (off < prefix.length && (n = in.read(prefix, off, prefix.length - off)) > 0) {
+            off += n;
+            downloaded.addAndGet(n);
+          }
         }
         if (off != prefix.length) throw new IOException("音频预检未完整返回");
         boolean flac =
@@ -613,8 +651,9 @@ public final class RelayCore implements Closeable {
           format = bits + "-bit / " + String.format(Locale.ROOT, "%.1f", rate / 1000.0) + " kHz";
         } else format = contentType.split(";")[0];
         Block b = new Block((int) Math.min(size, BLOCK));
-        System.arraycopy(prefix, 0, b.data, 0, prefix.length);
+        b.data = prefix;
         b.valid = prefix.length;
+        b.used = true;
         blocks.put(0, b);
         log("识别音频 " + id + " · " + format + " · 原样取流");
       } finally {
@@ -629,152 +668,196 @@ public final class RelayCore implements Closeable {
     synchronized Reader reader(long start, long end) {
       Reader r = new Reader(this, start, end);
       readers.add(r);
-      schedule();
+      updateWindow();
       return r;
     }
 
-    synchronized boolean needed(int index) {
-      for (Reader r : readers)
-        if (!r.closed
-            && index >= r.position / BLOCK
-            && index <= Math.min(r.end / BLOCK, r.position / BLOCK + window() - 1)) return true;
-      return false;
+    synchronized long cachedBytes() {
+      long bytes = 0;
+      for (Block b : blocks.values()) if (b.data != null) bytes += b.data.length;
+      return bytes;
     }
 
-    synchronized void trim() {
+    private void trim() {
+      int recent = 0;
+      for (Map.Entry<Integer, Block> entry : blocks.entrySet())
+        if (!wanted.containsKey(entry.getKey()) && entry.getValue().used) recent++;
       Iterator<Map.Entry<Integer, Block>> it = blocks.entrySet().iterator();
-      while (blocks.size() >= MAX_BLOCKS && it.hasNext()) {
-        Map.Entry<Integer, Block> e = it.next();
-        if (!e.getValue().busy && !needed(e.getKey())) it.remove();
+      while (it.hasNext()) {
+        Map.Entry<Integer, Block> entry = it.next();
+        if (wanted.containsKey(entry.getKey())) continue;
+        Block block = entry.getValue();
+        if (block.task != null && fetchers.remove(block.task)) block.task = null;
+        if (block.task == null && (!block.used || recent > RECENT_BLOCKS)) {
+          if (block.used) recent--;
+          it.remove();
+        }
       }
     }
 
-    synchronized void schedule() {
+    // Advance prefetch only when a reader moves to a different block, starts or leaves.
+    private void updateWindow() {
       if (closed || failure != null) return;
-      for (int step = 0; step < window(); step++)
+      wanted.clear();
+      int windowSize = window();
+      // Give every reader its nearest blocks before scheduling farther-ahead reads.
+      for (int step = 0; step < windowSize; step++)
         for (Reader r : readers) {
-          if (r.closed || r.position > r.end) continue;
-          final int index = (int) (r.position / BLOCK) + step;
-          if (index > r.end / BLOCK) continue;
-          Block b = blocks.get(index);
-          if (b == null) {
-            trim();
-            if (blocks.size() >= MAX_BLOCKS) continue;
-            b = new Block((int) Math.min(BLOCK, size - (long) index * BLOCK));
-            blocks.put(index, b);
-          }
-          if (b.valid == b.data.length || b.busy || b.failed) continue;
-          b.busy = true;
-          final Block block = b;
-          try {
-            fetchers.execute(
-                new Runnable() {
-                  public void run() {
-                    fetch(index, block);
-                  }
-                });
-          } catch (RejectedExecutionException e) {
-            b.busy = false;
-          }
+          if (r.position > r.end || step >= r.lookahead(windowSize)) continue;
+          int index = (int) (r.position / BLOCK) + step;
+          long start = (long) index * BLOCK;
+          if (start > r.end) continue;
+          if (wanted.size() < MAX_BLOCKS - RECENT_BLOCKS || wanted.containsKey(index))
+            wanted.merge(index, (int) Math.min(BLOCK, r.end - start + 1), Math::max);
         }
+      trim();
+      schedule();
+    }
+
+    private void schedule() {
+      if (!running || closed || failure != null) return;
+      for (Map.Entry<Integer, Integer> entry : wanted.entrySet()) {
+        int index = entry.getKey();
+        Block block = blocks.get(index);
+        if (block == null) {
+          if (blocks.size() >= MAX_BLOCKS) continue;
+          block = new Block((int) Math.min(BLOCK, size - (long) index * BLOCK));
+          blocks.put(index, block);
+        }
+        queueFetch(index, block, entry.getValue());
+      }
+    }
+
+    private void queueFetch(int index, Block block, int end) {
+      if (block.task != null || block.valid >= end) return;
+      block.task = () -> fetch(index, block);
+      try {
+        fetchers.execute(block.task);
+      } catch (RejectedExecutionException e) {
+        block.task = null;
+      }
     }
 
     private void fetch(int index, Block b) {
-      HttpURLConnection c = null;
       try {
-        for (int attempt = 0; attempt < 3 && !closed; attempt++) {
+        for (int attempt = 0; attempt < 3; attempt++) {
+          int offset, end;
+          byte[] data;
           synchronized (this) {
-            if (!needed(index)) {
+            Integer required = wanted.get(index);
+            if (!running || closed || failure != null || required == null || b.valid >= required)
               return;
-            }
-            if (b.valid == b.data.length) return;
+            offset = b.valid;
+            end = required;
+            if (b.data == null) b.data = new byte[end];
+            else if (b.data.length < end) b.data = Arrays.copyOf(b.data, end);
+            data = b.data;
           }
+          HttpURLConnection c = null;
+          IOException error;
           try {
-            int offset;
-            synchronized (this) {
-              offset = b.valid;
-            }
-            long first = (long) index * BLOCK + offset,
-                last = (long) index * BLOCK + b.data.length - 1;
-            c = open(url, first, last, size, etag, modified);
-            InputStream in = c.getInputStream();
-            byte[] temp = new byte[16384];
-            while (!closed) {
-              int length;
-              synchronized (this) {
-                length = b.data.length - b.valid;
-              }
-              if (length == 0) break;
-              int n = in.read(temp, 0, Math.min(temp.length, length));
-              if (n < 0) throw new EOFException("early EOF");
-              if (n == 0) continue;
-              downloaded.addAndGet(n);
-              synchronized (this) {
-                if (closed) return;
-                System.arraycopy(temp, 0, b.data, b.valid, n);
-                b.valid += n;
-                notifyAll();
+            long start = (long) index * BLOCK;
+            c = open(url, start + offset, start + end - 1, size, etag, modified);
+            try (InputStream in = c.getInputStream()) {
+              while (offset < end) {
+                int n = in.read(data, offset, Math.min(16384, end - offset));
+                if (n < 0) throw new EOFException("early EOF");
+                if (n == 0) throw new IOException("上游读取没有进展");
+                offset += n;
+                downloaded.addAndGet(n);
+                synchronized (this) {
+                  b.valid = offset;
+                  Integer required = wanted.get(index);
+                  if (!running || closed || failure != null || required == null) return;
+                  for (Reader r : readers) {
+                    if (r.waitingFor == index) {
+                      notifyAll();
+                      break;
+                    }
+                  }
+                  if (offset >= required) return;
+                }
               }
             }
-            return;
-          } catch (Fatal e) {
-            synchronized (this) {
-              failure = e.getMessage();
-              closed = true;
-              notifyAll();
-            }
-            log(failure);
             return;
           } catch (IOException e) {
-            if (attempt == 2) {
-              synchronized (this) {
-                b.failed = true;
-                failure = "音频片段重试 3 次失败，请检查 Wi-Fi 或重新播放";
-                notifyAll();
-              }
-              return;
-            }
-            retries.incrementAndGet();
-            try {
-              Thread.sleep(250L * (attempt + 1));
-            } catch (InterruptedException interrupted) {
-              Thread.currentThread().interrupt();
-              return;
-            }
+            error = e;
+          } catch (RuntimeException e) {
+            error = new Fatal("上游读取失败：" + safe(e));
           } finally {
             disconnect(c);
-            c = null;
+          }
+          synchronized (this) {
+            Integer required = wanted.get(index);
+            if (!running || closed || failure != null || required == null || b.valid >= required)
+              return;
+            if (error instanceof Fatal) {
+              fail(error.getMessage());
+            } else if (attempt == 2) {
+              fail("音频片段重试 3 次失败，请检查 Wi-Fi 或重新播放");
+            }
+          }
+          if (error instanceof Fatal) log(error.getMessage());
+          if (failure != null) return;
+          retries.incrementAndGet();
+          try {
+            Thread.sleep(250L * (attempt + 1));
+          } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return;
           }
         }
       } finally {
         synchronized (this) {
-          b.busy = false;
-          notifyAll();
+          b.task = null;
+          if (running && !closed && failure == null) {
+            Integer end = wanted.get(index);
+            if (end == null) {
+              trim();
+              schedule();
+            } else {
+              queueFetch(index, b, end);
+            }
+          }
         }
       }
     }
 
+    private void fail(String message) {
+      failure = message;
+      close();
+    }
+
     public synchronized void close() {
       closed = true;
+      for (Block b : blocks.values()) if (b.task != null) fetchers.remove(b.task);
       blocks.clear();
+      wanted.clear();
       notifyAll();
     }
   }
 
   class Reader implements Closeable {
     final Job job;
-    long position, end;
+    final long start, end;
+    long position;
     boolean closed;
+    int waitingFor = -1;
 
     Reader(Job j, long s, long e) {
       job = j;
-      position = s;
+      start = position = s;
       end = e;
+    }
+
+    int lookahead(int limit) {
+      int growth = (int) Math.min(4, (position - start) / BLOCK);
+      return Math.min(limit, START_WINDOW << growth);
     }
 
     void prefill() throws IOException {
       synchronized (job) {
-        long target = Math.min(512 * 1024, end - position + 1), until = now() + 40000;
+        long target = Math.min(START_BUFFER, end - position + 1), until = now() + 40000;
         while (true) {
           if (!running || closed || job.closed || job.failure != null)
             throw new IOException(job.failure != null ? job.failure : "播放已取消");
@@ -786,24 +869,23 @@ public final class RelayCore implements Closeable {
             int n = (int) Math.min(target - available, b.valid - offset);
             p += n;
             available += n;
-            if (b.valid < b.data.length) break;
+            if (b.valid < b.length) break;
           }
           if (available >= target) return;
-          job.schedule();
           long left = until - now();
           if (left <= 0) throw new IOException("启动缓冲超时");
-          try {
-            job.wait(Math.min(left, 1000));
-          } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("播放已取消");
-          }
+          awaitBlock((int) (p / BLOCK), left);
         }
       }
     }
 
-    int read(byte[] out) throws IOException {
+    int read(byte[] out, int delivered) throws IOException {
       synchronized (job) {
+        // The previous write has succeeded. A blocked or aborted write never grows the window.
+        long previous = position;
+        position += delivered;
+        if (previous / BLOCK != position / BLOCK || previous <= end && position > end)
+          job.updateWindow();
         long until = now() + 40000;
         while (true) {
           if (closed || !running) throw new IOException("播放已结束");
@@ -815,21 +897,25 @@ public final class RelayCore implements Closeable {
           if (b != null && b.valid > offset) {
             int n = (int) Math.min(Math.min(out.length, b.valid - offset), end - position + 1);
             System.arraycopy(b.data, offset, out, 0, n);
-            position += n;
-            job.lastUsed = now();
-            job.schedule();
+            b.used = true;
             return n;
           }
-          job.schedule();
           long left = until - now();
           if (left <= 0) throw new IOException("等待音频片段超时");
-          try {
-            job.wait(Math.min(left, 1000));
-          } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("播放已取消");
-          }
+          awaitBlock(index, left);
         }
+      }
+    }
+
+    private void awaitBlock(int index, long timeout) throws IOException {
+      waitingFor = index;
+      try {
+        job.wait(timeout);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IOException("播放已取消");
+      } finally {
+        waitingFor = -1;
       }
     }
 
@@ -837,7 +923,7 @@ public final class RelayCore implements Closeable {
       synchronized (job) {
         closed = true;
         job.readers.remove(this);
-        job.lastUsed = now();
+        job.updateWindow();
         job.notifyAll();
       }
     }
@@ -861,6 +947,7 @@ public final class RelayCore implements Closeable {
   }
 
   private static void quiet(Closeable c) {
+    if (c == null) return;
     try {
       c.close();
     } catch (Exception ignored) {
@@ -874,7 +961,7 @@ public final class RelayCore implements Closeable {
     }
     state = "已停止";
     if (server != null) quiet(server);
-    for (Socket s : sockets) quiet(s);
+    for (Socket s : clientsBySocket.keySet()) quiet(s);
     for (HttpURLConnection c : upstream) disconnect(c);
     synchronized (jobs) {
       for (Job j : jobs.values()) j.close();

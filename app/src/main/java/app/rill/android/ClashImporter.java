@@ -12,11 +12,11 @@ import android.widget.Toast;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.Executor;
 
 /** Shares immutable configuration snapshots with an explicitly selected Clash app. */
 final class ClashImporter {
@@ -24,8 +24,7 @@ final class ClashImporter {
 
   private ClashImporter() {}
 
-  static void importConfig(Activity activity, String yaml) {
-    if (yaml.isEmpty()) return;
+  static void importConfig(Activity activity, ConfigFiles files, Executor io) {
     Intent probe = new Intent(Intent.ACTION_VIEW, Uri.parse("clash://install-config"));
     List<ResolveInfo> found =
         activity
@@ -39,7 +38,7 @@ final class ClashImporter {
     }
     ArrayList<ResolveInfo> candidates = new ArrayList<>(apps.values());
     if (candidates.size() == 1) {
-      send(activity, candidates.get(0), yaml);
+      send(activity, candidates.get(0), files, io);
       return;
     }
     String[] names = new String[candidates.size()];
@@ -47,11 +46,30 @@ final class ClashImporter {
       names[i] = candidates.get(i).loadLabel(activity.getPackageManager()).toString();
     new AlertDialog.Builder(activity)
         .setTitle("导入到")
-        .setItems(names, (dialog, which) -> send(activity, candidates.get(which), yaml))
+        .setItems(names, (dialog, which) -> send(activity, candidates.get(which), files, io))
         .show();
   }
 
-  private static void send(Activity activity, ResolveInfo target, String yaml) {
+  private static void send(Activity activity, ResolveInfo target, ConfigFiles files, Executor io) {
+    io.execute(
+        () -> {
+          Intent intent = prepareImport(activity, target, files);
+          activity.runOnUiThread(
+              () -> {
+                if (activity.isFinishing() || activity.isDestroyed()) return;
+                try {
+                  if (intent != null) {
+                    activity.startActivity(intent);
+                    return;
+                  }
+                } catch (RuntimeException ignored) {
+                }
+                toast(activity, "无法打开 Clash，请使用保存文件");
+              });
+        });
+  }
+
+  private static Intent prepareImport(Activity activity, ResolveInfo target, ConfigFiles files) {
     try {
       File directory = new File(activity.getFilesDir(), "shared");
       if (!directory.exists() && !directory.mkdirs()) throw new IOException();
@@ -67,8 +85,12 @@ final class ClashImporter {
         }
       }
       String id = UUID.randomUUID().toString();
-      try (FileOutputStream out = new FileOutputStream(new File(directory, id + ".yaml"))) {
-        out.write(yaml.getBytes(StandardCharsets.UTF_8));
+      File snapshot = new File(directory, id + ".yaml");
+      try (FileOutputStream out = new FileOutputStream(snapshot)) {
+        files.copyAdapted(out);
+      } catch (IOException e) {
+        snapshot.delete();
+        throw e;
       }
       Uri config = snapshotUri(activity, id);
       activity.grantUriPermission(
@@ -87,9 +109,9 @@ final class ClashImporter {
                   new ComponentName(target.activityInfo.packageName, target.activityInfo.name));
       intent.setClipData(ClipData.newRawUri("Rill-Clash.yaml", config));
       intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-      activity.startActivity(intent);
+      return intent;
     } catch (Exception e) {
-      toast(activity, "无法打开 Clash，请使用保存文件");
+      return null;
     }
   }
 

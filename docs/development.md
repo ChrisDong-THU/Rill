@@ -18,7 +18,7 @@ flowchart LR
 | --- | --- |
 | Android 界面 | `MainActivity` 组织连接、配置和记录页面；`Design` 统一样式 |
 | Android 配置 | `ConfigFiles` 管理私有配置文件的原子写入；`ClashImporter` 创建不可变快照；`ConfigProvider` 仅提供授权读取 |
-| Android 会话 | `RelayService` 管理前台会话、监听恢复、采样与异步诊断；`WifiUpstream` 注入 Wi-Fi 连接；`BackgroundGuard` 管理会话锁 |
+| Android 会话 | `RelayService` 管理前台会话、监听恢复、采样与异步诊断；`WifiUpstream` 注入 Wi-Fi 连接；`BackgroundGuard` 管理取流唤醒锁 |
 | Java 中继 | `RelayCore` 管理连接配额、任务、分块、缓存和重试；`RelayHttp` 管理有界 HTTP 解析与单段 Range |
 | Java 配置 | `Targets` 校验允许来源；`ConfigSource` 有界读取和下载；`ConfigAdapter` 安全解析及生成 YAML |
 
@@ -27,15 +27,18 @@ flowchart LR
 ## 并发与资源
 
 - 任务缓存由 `jobs` 锁保护，网络预检在锁外执行。同 URL 合并预检，不同 URL 可并行；创建中的任务计入最多两个任务的容量。
-- 每个任务最多 48 个 256 KiB 分块，即 12 MiB 数据缓存；两个任务合计最多 24 MiB，不含连接和其他运行开销。
-- 全局上游配额为 1–16，包含预检；降低配额后允许已有连接完成。
+- 每个任务最多缓存 48 个分块，每块最多 256 KiB。两个任务的音频缓存上限合计为 24 MiB。每个读者从最多 3 块开始预取，以覆盖非对齐请求的 512 KiB 启动缓冲。连续发送的字节达到整块时才扩张窗口，直到连接上限对应的窗口大小。优先安排各读者最近的分块。排队时只保留分块信息，开始下载才分配字节数组，末块只取到请求所需的字节。读者离开后清理失效的预取，待在途读取结束后，每个空闲任务最多保留最近 4 块（1 MiB）。
+- 全局上游配额为 1–16，包含预检。降低配额后允许已有连接完成，重试退避期间归还连接配额，空闲取流线程超时退出。
 - 临时预检和分块失败最多尝试 3 次；协议、内容范围或版本校验失败直接拒绝。
 - `If-Range` 条件在 Range 解析前判断；过期或弱 ETag 条件返回完整内容。HEAD 忽略 Range。语义依据 [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#name-if-range)。
 - 服务维护、网络回调、诊断写盘分别使用独立线程；停止时关闭监听、客户端、上游、任务及线程。
+- 诊断有活动时每 10 秒采样，空闲时每 60 秒采样。后台调度恢复后即时采样。周期写盘只保存最近 24 条采样和 60 条事件，手动导出和停止服务时保存完整的有界历史（最多 900 条采样和 200 条事件）。诊断中的 `cached_audio_bytes` 记录当时已分配的音频缓存。
 - 前台会话与监听就绪分别表示。监听失败保留开启意图，由服务自动恢复，不依赖 Activity 的 `onResume`。
-- CPU 锁与 Wi-Fi 网络请求随会话释放；Android 14 起不再依赖旧式 Wi-Fi 高性能锁维持后台运行。
+- 已通过目标校验的 GET 和 HEAD 在预检前获取唤醒锁。最后一个请求结束后保留 60 秒宽限期，之后释放 CPU 锁及旧版 Wi-Fi 锁。前台监听和 Wi-Fi 网络请求由会话管理，停止服务时统一释放。Android 14 起不再使用旧式 Wi-Fi 高性能锁。
 
-配置读取和适配在单独 I/O 线程完成，失败时保留上次可用结果。`ConfigFiles` 对每个文件使用 `AtomicFile`，中断写入回滚该文件；两个文件不构成跨文件事务。改动配置提交逻辑时，应保持该边界明确。
+Media3 与 mpv 的播放器缓存可以用解码时间和缓存字节数决定何时继续加载。Rill 能观察到的是本地套接字成功发送的字节，所以使用读取位置推进窗口，并保留字节上限。rclone 也把分块尺寸和并行读流作为独立参数。联合测试中，BubbleUPnP 在开播后很快接收了大部分音频，4 路和 8 路的 CPU 采样接近。单次短样本不足以据此调低默认连接上限。 [Media3 缓冲策略](https://developer.android.com/reference/androidx/media3/exoplayer/DefaultLoadControl) · [mpv 缓存选项](https://github.com/mpv-player/mpv/blob/master/DOCS/man/options.rst) · [rclone 分块读取](https://rclone.org/commands/rclone_mount/#vfs-chunked-reading)
+
+配置读取、适配和导出在 I/O 线程完成，失败时保留上次可用结果。界面只保留配置的可用状态和来源，导出及分享时分段复制已适配的文件。`ConfigFiles` 对源配置和适配结果分别使用 `AtomicFile`，每次中断写入只回滚对应文件。
 
 ## 运行约定
 

@@ -6,14 +6,18 @@ import android.content.Context;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import org.json.JSONObject;
 
-/** Owned by the foreground relay session, not by Activity or individual tracks. */
+/** Keeps the device awake during validated relay requests and a short idle grace period. */
 public final class BackgroundGuard {
+  private static final long IDLE_GRACE_MS = 60000;
   private final Context context;
   private final PowerManager power;
   private final PowerManager.WakeLock cpu;
   private final WifiManager.WifiLock wifi;
+  private int requests;
+  private long idleUntil;
   private boolean closed;
 
   public BackgroundGuard(Context context) {
@@ -29,18 +33,35 @@ public final class BackgroundGuard {
     if (wifi != null) wifi.setReferenceCounted(false);
   }
 
-  @SuppressLint(
-      "WakelockTimeout") // Bound to the user-enabled foreground service, released in close.
+  public synchronized void requestStarted() {
+    if (closed) return;
+    requests++;
+    maintain();
+  }
+
+  public synchronized void requestFinished() {
+    if (closed) return;
+    if (--requests == 0) idleUntil = SystemClock.elapsedRealtime() + IDLE_GRACE_MS;
+  }
+
+  @SuppressLint("WakelockTimeout") // Released after request completion or foreground service stop.
   public synchronized void maintain() {
     if (closed) return;
-    // Do not let a delayed notification, disk write or network recovery expire the session lock.
-    // Android releases it if the process dies; normal service shutdown calls close().
-    if (!cpu.isHeld()) cpu.acquire();
-    if (wifi != null && !wifi.isHeld()) wifi.acquire();
+    if (requests > 0 || SystemClock.elapsedRealtime() < idleUntil) {
+      if (!cpu.isHeld()) cpu.acquire();
+      if (wifi != null && !wifi.isHeld()) wifi.acquire();
+    } else {
+      releaseLocks();
+    }
   }
 
   public synchronized void close() {
     closed = true;
+    requests = 0;
+    releaseLocks();
+  }
+
+  private void releaseLocks() {
     if (cpu.isHeld()) cpu.release();
     if (wifi != null && wifi.isHeld()) wifi.release();
   }
@@ -52,7 +73,9 @@ public final class BackgroundGuard {
       j.put("wifi_lock_held", wifi != null && wifi.isHeld());
       // API 34 maps HIGH_PERF to a foreground-only lock, unsuitable for this background relay.
       j.put("wifi_lock_supported", wifi != null);
-      j.put("cpu_lock_scope", "foreground_service_session");
+      j.put("cpu_lock_scope", "relay_requests_and_idle_grace");
+      j.put("requests_in_flight", requests);
+      j.put("idle_grace_ms", IDLE_GRACE_MS);
       j.put("battery_exempt", power.isIgnoringBatteryOptimizations(context.getPackageName()));
       j.put("device_idle", power.isDeviceIdleMode());
       j.put("power_save", power.isPowerSaveMode());

@@ -260,9 +260,12 @@ class Matrix:
         self.shell("input keyevent 223")
         # No ADB polling or player traffic during the idle interval.
         time.sleep(180)
+        power = self.report().get("background", {})
+        assert power.get("cpu_lock_held") is False, "Rill still holds the CPU lock while idle"
         transfer = self.request()
         after = self.shell("pidof app.rill.android")
-        return {"idle_seconds": 180, "same_process": before == after, "transfer": transfer}
+        return {"idle_seconds": 180, "cpu_lock_held_before_resume": False,
+                "same_process": before == after, "transfer": transfer}
 
     def restricted_network(self):
         self.original_restricted_mode = self.shell("settings get global restricted_networking_mode")

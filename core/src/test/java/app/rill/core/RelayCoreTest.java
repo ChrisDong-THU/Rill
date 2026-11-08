@@ -6,7 +6,10 @@ import com.sun.net.httpserver.HttpServer;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -202,7 +205,8 @@ public class RelayCoreTest {
   @Test
   public void retriesTransientTrackPreflightFailure() throws Exception {
     AtomicInteger attempts = new AtomicInteger();
-    try (RelayCore relay = preflightFixture(attempts, false)) {
+    AtomicInteger closedResponses = new AtomicInteger();
+    try (RelayCore relay = preflightFixture(attempts, closedResponses, false)) {
       relay.setTargets(Targets.parse("example.com"));
       relay.start(0);
       Response response =
@@ -210,6 +214,7 @@ public class RelayCoreTest {
       assertTrue(response.headers.startsWith("HTTP/1.1 200"));
       assertArrayEquals(new byte[] {1, 2, 3, 4}, response.body);
       assertEquals(2, attempts.get());
+      assertEquals(1, closedResponses.get());
       assertEquals(1, relay.retries.get());
       assertEquals(0, relay.connections.get());
     }
@@ -218,19 +223,22 @@ public class RelayCoreTest {
   @Test
   public void doesNotRetryRejectedTrackPreflight() throws Exception {
     AtomicInteger attempts = new AtomicInteger();
-    try (RelayCore relay = preflightFixture(attempts, true)) {
+    AtomicInteger closedResponses = new AtomicInteger();
+    try (RelayCore relay = preflightFixture(attempts, closedResponses, true)) {
       relay.setTargets(Targets.parse("example.com"));
       relay.start(0);
       Response response =
           request(relay.getListeningPort(), "GET http://example.com/track HTTP/1.1\r\n\r\n");
       assertTrue(response.headers.startsWith("HTTP/1.1 502"));
       assertEquals(1, attempts.get());
+      assertEquals(1, closedResponses.get());
       assertEquals(0, relay.retries.get());
       assertEquals(0, relay.connections.get());
     }
   }
 
-  private static RelayCore preflightFixture(AtomicInteger attempts, boolean rejected) {
+  private static RelayCore preflightFixture(
+      AtomicInteger attempts, AtomicInteger closedResponses, boolean rejected) {
     return new RelayCore(
         url ->
             new HttpURLConnection(url) {
@@ -252,7 +260,12 @@ public class RelayCoreTest {
 
               @Override
               public InputStream getInputStream() {
-                return new ByteArrayInputStream(new byte[] {1, 2, 3, 4});
+                return trackedBody(new byte[] {1, 2, 3, 4}, closedResponses::incrementAndGet);
+              }
+
+              @Override
+              public InputStream getErrorStream() {
+                return trackedBody(new byte[] {1}, closedResponses::incrementAndGet);
               }
 
               @Override
@@ -347,6 +360,258 @@ public class RelayCoreTest {
         }) {
       assertThrows(IOException.class, () -> RelayCore.range(value, 100));
     }
+  }
+
+  @Test
+  public void shortRangesReusePrefixAndResumeAtTheFirstMissingByte() throws Exception {
+    int block = RelayCore.BLOCK;
+    List<String> ranges = Collections.synchronizedList(new ArrayList<>());
+    CountDownLatch closedResponses = new CountDownLatch(4);
+    try (RelayCore relay =
+        new RelayCore(
+            url ->
+                rangedTrack(
+                    url,
+                    block * 2,
+                    range -> {
+                      ranges.add("" + range[0] + "-" + range[1]);
+                      int length = (int) (range[1] - range[0] + 1);
+                      if (range[0] == block + 100) length = 20;
+                      return trackedBody(
+                          trackBytes((int) range[0], length), closedResponses::countDown);
+                    }),
+            message -> {},
+            1)) {
+      relay.setTargets(Targets.parse("example.com"));
+      relay.start(0);
+      int port = relay.getListeningPort();
+      assertArrayEquals(trackBytes(10, 10), trackRange(port, 10, 19).body);
+      assertEquals(65536, relay.downloaded.get());
+      assertArrayEquals(trackBytes(block + 10, 90), trackRange(port, block + 10, block + 99).body);
+      assertArrayEquals(
+          trackBytes(block + 95, 105), trackRange(port, block + 95, block + 199).body);
+      assertEquals(
+          Arrays.asList(
+              "0-65535",
+              block + "-" + (block + 99),
+              (block + 100) + "-" + (block + 199),
+              (block + 120) + "-" + (block + 199)),
+          ranges);
+      assertEquals(65536 + 200, relay.downloaded.get());
+      assertEquals(1, relay.retries.get());
+      assertTrue("Range bodies were left open", closedResponses.await(2, TimeUnit.SECONDS));
+    }
+  }
+
+  private static InputStream trackedBody(byte[] bytes, Runnable closed) {
+    return new ByteArrayInputStream(bytes) {
+      @Override
+      public void close() {
+        closed.run();
+      }
+    };
+  }
+
+  @Test
+  public void retriesABlockWhenTheUpstreamMakesNoReadProgress() throws Exception {
+    int block = RelayCore.BLOCK;
+    AtomicInteger attempts = new AtomicInteger();
+    try (RelayCore relay =
+        new RelayCore(
+            url ->
+                rangedTrack(
+                    url,
+                    block * 2,
+                    range -> {
+                      if (range[0] == block && attempts.incrementAndGet() == 1) {
+                        return new InputStream() {
+                          @Override
+                          public int read() {
+                            return 0;
+                          }
+
+                          @Override
+                          public int read(byte[] out, int offset, int length) {
+                            return 0;
+                          }
+                        };
+                      }
+                      return new ByteArrayInputStream(
+                          trackBytes((int) range[0], (int) (range[1] - range[0] + 1)));
+                    }),
+            message -> {},
+            1)) {
+      relay.setTargets(Targets.parse("example.com"));
+      relay.start(0);
+      assertArrayEquals(
+          trackBytes(block, 32), trackRange(relay.getListeningPort(), block, block + 31).body);
+      assertEquals(2, attempts.get());
+      assertEquals(1, relay.retries.get());
+    }
+  }
+
+  @Test
+  public void boundsReadAheadBeforeSendingResponseBytes() throws Exception {
+    int block = RelayCore.BLOCK, end = 8 * block + 20;
+    CountDownLatch startup = new CountDownLatch(3);
+    CountDownLatch speculative = new CountDownLatch(1);
+    CountDownLatch release = new CountDownLatch(1);
+    ExecutorService client = Executors.newSingleThreadExecutor();
+    try (RelayCore relay =
+        new RelayCore(
+            url ->
+                rangedTrack(
+                    url,
+                    end + 1,
+                    range -> {
+                      if (range[1] > 65535) {
+                        if (range[0] < 3L * block) startup.countDown();
+                        else speculative.countDown();
+                        awaitPreflight(release);
+                      }
+                      return new ByteArrayInputStream(
+                          trackBytes((int) range[0], (int) (range[1] - range[0] + 1)));
+                    }),
+            message -> {})) {
+      relay.setTargets(Targets.parse("example.com"));
+      relay.start(0);
+      Future<Response> response = client.submit(() -> trackRange(relay.getListeningPort(), 1, end));
+      try {
+        assertTrue(startup.await(3, TimeUnit.SECONDS));
+        assertFalse(
+            "Scheduled outside the startup window", speculative.await(250, TimeUnit.MILLISECONDS));
+      } finally {
+        release.countDown();
+      }
+      assertArrayEquals(trackBytes(1, end), response.get(10, TimeUnit.SECONDS).body);
+      assertEquals(0, speculative.getCount());
+    } finally {
+      release.countDown();
+      client.shutdownNow();
+    }
+  }
+
+  @Test
+  public void discardsBuffersWhenUpstreamRejectsABlock() throws Exception {
+    int block = RelayCore.BLOCK;
+    try (RelayCore relay =
+        new RelayCore(
+            url ->
+                rangedTrack(
+                    url,
+                    block * 2,
+                    range -> {
+                      if (range[0] >= block) throw new RelayCore.Fatal("unexpected version");
+                      return new ByteArrayInputStream(trackBytes(0, 65536));
+                    }),
+            message -> {},
+            1)) {
+      relay.setTargets(Targets.parse("example.com"));
+      relay.start(0);
+      assertTrue(
+          trackRange(relay.getListeningPort(), block, block + 99)
+              .headers
+              .startsWith("HTTP/1.1 502"));
+      assertEquals(0, relay.retries.get());
+      assertEquals(0, relay.getCachedBytes());
+    }
+  }
+
+  @Test
+  public void givesDisjointReadersRoomToAdvanceAndTrimsCacheWhenIdle() throws Exception {
+    int readerCount = 6, block = RelayCore.BLOCK;
+    int stride = 16 * block, length = 12 * block + 20;
+    CountDownLatch readers = new CountDownLatch(readerCount);
+    ExecutorService players = Executors.newFixedThreadPool(readerCount);
+    try (RelayCore relay =
+        new RelayCore(
+            url ->
+                rangedTrack(
+                    url,
+                    readerCount * stride,
+                    range -> {
+                      if (range[1] >= 65536) awaitPreflight(readers);
+                      return new ByteArrayInputStream(
+                          trackBytes((int) range[0], (int) (range[1] - range[0] + 1)));
+                    }),
+            message -> {
+              if (message.startsWith("播放请求")) readers.countDown();
+            })) {
+      relay.setTargets(Targets.parse("example.com"));
+      relay.start(0);
+      List<Future<?>> pending = new ArrayList<>();
+      for (int i = 0; i < readerCount; i++) {
+        int start = i * stride + 100;
+        pending.add(
+            players.submit(
+                () -> {
+                  Response response =
+                      trackRange(relay.getListeningPort(), start, start + length - 1);
+                  assertTrue(response.headers.startsWith("HTTP/1.1 206"));
+                  assertArrayEquals(trackBytes(start, length), response.body);
+                  return null;
+                }));
+      }
+      for (Future<?> player : pending) player.get(15, TimeUnit.SECONDS);
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+      while (relay.getCachedBytes() > 4L * block && System.nanoTime() < deadline) Thread.sleep(10);
+      assertTrue(relay.getCachedBytes() <= 4L * block);
+    } finally {
+      players.shutdownNow();
+    }
+  }
+
+  private static Response trackRange(int port, int start, int end) throws IOException {
+    return request(
+        port,
+        "GET http://example.com/audio HTTP/1.1\r\nRange: bytes=" + start + "-" + end + "\r\n\r\n");
+  }
+
+  private static byte[] trackBytes(int first, int length) {
+    byte[] bytes = new byte[length];
+    for (int i = 0; i < length; i++) {
+      int position = first + i;
+      bytes[i] = (byte) (position ^ position >>> 8 ^ position >>> 16);
+    }
+    return bytes;
+  }
+
+  private interface RangeBody {
+    InputStream open(long[] range) throws IOException;
+  }
+
+  private static HttpURLConnection rangedTrack(URL url, int size, RangeBody body) {
+    return new HttpURLConnection(url) {
+      private long[] range;
+
+      @Override
+      public int getResponseCode() throws IOException {
+        range = RelayCore.range(getRequestProperty("Range"), size);
+        return 206;
+      }
+
+      @Override
+      public String getHeaderField(String name) {
+        if (name.equals("Content-Range")) return "bytes " + range[0] + "-" + range[1] + "/" + size;
+        return null;
+      }
+
+      @Override
+      public InputStream getInputStream() throws IOException {
+        return body.open(range);
+      }
+
+      @Override
+      public void disconnect() {}
+
+      @Override
+      public boolean usingProxy() {
+        return false;
+      }
+
+      @Override
+      public void connect() {}
+    };
   }
 
   @Test

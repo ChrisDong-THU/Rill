@@ -37,10 +37,13 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.Date;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.function.Supplier;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -53,14 +56,18 @@ public final class MainActivity extends Activity {
   private TextView title, status, rate, total, toggle, logText, backgroundButton;
   private Design.Flow flow;
   private int page, pendingExport;
-  private boolean working, resumed;
-  private String sourceName = "", adapted = "", adaptError = "";
+  private boolean working, resumed, hasAdapted, loadingEvents;
+  private String sourceName = "", adaptError = "", savedEvents;
+  private String targetsPreference;
+  private Targets parsedTargets;
+  private RelayService recordsService;
   private final Handler handler = new Handler(Looper.getMainLooper());
   private final ExecutorService io = Executors.newSingleThreadExecutor();
+  private Future<?> adaptation;
   private final Runnable refresh =
       new Runnable() {
         public void run() {
-          if (!resumed) return;
+          if (!resumed || page == 1) return;
           update();
           handler.postDelayed(this, 1000);
         }
@@ -149,6 +156,17 @@ public final class MainActivity extends Activity {
   private void show(int next, boolean animate) {
     int old = page;
     page = next;
+    if (page == 2) savedEvents = null;
+    else {
+      logText = backgroundButton = null;
+      recordsService = null;
+      savedEvents = null;
+    }
+    if (page != 0 && flow != null) {
+      flow.setState(flow.active, false);
+      flow = null;
+      title = status = rate = total = toggle = null;
+    }
     View previous = host.getChildCount() > 0 ? host.getChildAt(host.getChildCount() - 1) : null;
     View current = page == 0 ? home() : page == 1 ? configuration() : records();
     host.addView(current, new FrameLayout.LayoutParams(-1, -1));
@@ -174,6 +192,8 @@ public final class MainActivity extends Activity {
     }
     buildNavigation();
     update();
+    handler.removeCallbacks(refresh);
+    if (resumed && page != 1) handler.postDelayed(refresh, 1000);
   }
 
   private void buildNavigation() {
@@ -301,7 +321,7 @@ public final class MainActivity extends Activity {
       TextView t = label("正在读取配置", 17);
       t.setGravity(Gravity.CENTER);
       output.addView(t);
-    } else if (adapted.isEmpty()) {
+    } else if (!hasAdapted) {
       Design.Icon icon = new Design.Icon(this, "config", d.muted);
       LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(d.dp(38), d.dp(38));
       p.gravity = Gravity.CENTER;
@@ -338,7 +358,7 @@ public final class MainActivity extends Activity {
       gap(output, 22);
       TextView send = d.button("导入 Clash", true);
       addButton(output, send);
-      send.setOnClickListener(v -> ClashImporter.importConfig(this, adapted));
+      send.setOnClickListener(v -> ClashImporter.importConfig(this, configFiles, io));
       gap(output, 10);
       TextView save = d.button("保存文件", false);
       addButton(output, save);
@@ -350,7 +370,7 @@ public final class MainActivity extends Activity {
       output.addView(clear);
       clear.setOnClickListener(
           v -> {
-            adapted = "";
+            hasAdapted = false;
             sourceName = "";
             adaptError = "";
             configFiles.clear();
@@ -423,19 +443,26 @@ public final class MainActivity extends Activity {
           title.animate().alpha(1).setDuration(240).start();
         }
       }
-      status.setText(ready && c.active.get() > 0 ? c.format : targets().summary());
-      toggle.setText(on ? "停止" : "开启");
-      rate.setText(ready ? String.format(Locale.ROOT, "%.0f KB/s", s.speed) : "—");
-      total.setText(
-          ready ? String.format(Locale.ROOT, "%.1f MiB", c.served.get() / 1048576.0) : "—");
+      setTextIfChanged(status, ready && c.active.get() > 0 ? c.format : targets().summary());
+      setTextIfChanged(toggle, on ? "停止" : "开启");
+      setTextIfChanged(rate, ready ? Math.round(s.speed) + " KB/s" : "—");
+      setTextIfChanged(
+          total, ready ? String.format(Locale.ROOT, "%.1f MiB", c.served.get() / 1048576.0) : "—");
       flow.setState(on, ready && c.connections.get() > 0);
     }
     if (page == 2 && logText != null) {
-      if (backgroundButton != null)
-        backgroundButton.setText(batteryExempt() ? "后台运行 · 已允许" : "允许后台运行");
-      String text = s == null ? lastEvents() : s.logText();
-      if (!text.contentEquals(logText.getText())) logText.setText(text.isEmpty() ? "尚无播放记录" : text);
+      if (s != recordsService) {
+        if (s == null) savedEvents = recordsService.logText();
+        recordsService = s;
+      }
+      if (s == null && savedEvents == null) loadSavedEvents();
+      String events = s == null ? savedEvents : s.logText();
+      if (events != null) setTextIfChanged(logText, events.isEmpty() ? "尚无播放记录" : events);
     }
+  }
+
+  private static void setTextIfChanged(TextView view, String value) {
+    if (!value.contentEquals(view.getText())) view.setText(value);
   }
 
   private int limit() {
@@ -502,7 +529,7 @@ public final class MainActivity extends Activity {
     }
     new AlertDialog.Builder(this)
         .setTitle("允许后台运行")
-        .setMessage("避免锁屏或切换应用后暂停加速。开启期间会保持 CPU 和 Wi-Fi 工作，停止后释放。")
+        .setMessage("避免锁屏或切换应用后暂停加速。取流期间会保持 CPU 和 Wi-Fi 工作，长时间空闲后释放唤醒锁。")
         .setPositiveButton(
             "去设置",
             (dialog, which) -> {
@@ -634,11 +661,16 @@ public final class MainActivity extends Activity {
   }
 
   private Targets targets() {
-    try {
-      return Targets.parse(prefs.getString("targets", Targets.DEFAULT));
-    } catch (IOException e) {
-      return Targets.defaults();
+    String value = prefs.getString("targets", Targets.DEFAULT);
+    if (!value.equals(targetsPreference)) {
+      try {
+        parsedTargets = Targets.parse(value);
+      } catch (IOException e) {
+        parsedTargets = Targets.defaults();
+      }
+      targetsPreference = value;
     }
+    return parsedTargets;
   }
 
   private void targetSheet() {
@@ -679,7 +711,8 @@ public final class MainActivity extends Activity {
             }
             dialog.dismiss();
             update();
-            if (configFiles.hasSource()) work(sourceName, configFiles::readSource);
+            if (configFiles.hasSource())
+              work(() -> prefs.getString("config_source", "Clash 配置"), configFiles::readSource);
             else toast("已保存");
           } catch (IOException e) {
             input.setError(e.getMessage());
@@ -747,52 +780,64 @@ public final class MainActivity extends Activity {
   }
 
   private void work(String source, Input input) {
+    work(() -> source, input);
+  }
+
+  private void work(Supplier<String> source, Input input) {
     if (working) return;
     working = true;
     adaptError = "";
     Targets requestedTargets = targets();
     show(1, false);
-    io.execute(
-        () -> {
-          try {
-            String raw = input.read();
-            ConfigAdapter.Result result = ConfigAdapter.adapt(raw, requestedTargets);
-            configFiles.save(raw, result.yaml);
-            prefs.edit().putString("config_source", source).apply();
-            runOnUiThread(
-                () -> {
-                  if (isFinishing() || isDestroyed()) return;
-                  working = false;
-                  adapted = result.yaml;
-                  sourceName = source;
-                  if (page == 1) show(1, false);
-                  toast("配置已适配");
-                });
-          } catch (Exception e) {
-            final String msg = e instanceof IOException ? e.getMessage() : "无法读取配置文件";
-            runOnUiThread(
-                () -> {
-                  if (isFinishing() || isDestroyed()) return;
-                  working = false;
-                  adaptError = msg == null ? "无法读取配置文件" : msg;
-                  if (page == 1) show(1, false);
-                  else toast("配置适配失败");
-                });
-          }
-        });
+    adaptation =
+        io.submit(
+            () -> {
+              try {
+                String name = source.get();
+                String raw = input.read();
+                ConfigAdapter.Result result = ConfigAdapter.adapt(raw, requestedTargets);
+                configFiles.save(raw, result.yaml);
+                prefs.edit().putString("config_source", name).apply();
+                runOnUiThread(
+                    () -> {
+                      if (isFinishing() || isDestroyed()) return;
+                      working = false;
+                      hasAdapted = true;
+                      sourceName = name;
+                      if (page == 1) show(1, false);
+                      toast("配置已适配");
+                    });
+              } catch (Exception e) {
+                final String msg = e instanceof IOException ? e.getMessage() : "无法读取配置文件";
+                runOnUiThread(
+                    () -> {
+                      if (isFinishing() || isDestroyed()) return;
+                      working = false;
+                      adaptError = msg == null ? "无法读取配置文件" : msg;
+                      if (page == 1) show(1, false);
+                      else toast("配置适配失败");
+                    });
+              }
+            });
   }
 
   private void loadAdapted() {
-    try {
-      adapted = configFiles.readAdapted();
-      sourceName = prefs.getString("config_source", "Clash 配置");
-    } catch (Exception ignored) {
-      adapted = "";
-    }
+    io.execute(
+        () -> {
+          boolean available = configFiles.hasAdapted();
+          String name = prefs.getString("config_source", "Clash 配置");
+          runOnUiThread(
+              () -> {
+                if (isFinishing() || isDestroyed()) return;
+                hasAdapted = available;
+                if (available) sourceName = name;
+                if (page == 1 && !working) show(1, false);
+              });
+        });
   }
 
   private void export(int kind) {
-    if (kind == 1 && adapted.isEmpty()) {
+    if (kind == 1 && !hasAdapted) {
       toast("请先导入配置");
       return;
     }
@@ -833,41 +878,71 @@ public final class MainActivity extends Activity {
     }
   }
 
+  private void loadSavedEvents() {
+    if (loadingEvents) return;
+    loadingEvents = true;
+    io.execute(
+        () -> {
+          String events = lastEvents();
+          runOnUiThread(
+              () -> {
+                if (isFinishing() || isDestroyed()) return;
+                loadingEvents = false;
+                if (savedEvents == null) savedEvents = events;
+                if (page == 2) update();
+              });
+        });
+  }
+
+  private String fileName(Uri uri) {
+    try (Cursor cursor =
+        getContentResolver()
+            .query(uri, new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+      if (cursor != null && cursor.moveToFirst()) {
+        String name = cursor.getString(0);
+        if (name != null) return name;
+      }
+    } catch (Exception ignored) {
+    }
+    return "Clash 配置";
+  }
+
   @Override
   protected void onActivityResult(int req, int code, Intent data) {
     super.onActivityResult(req, code, data);
     if (code != RESULT_OK || data == null || data.getData() == null) return;
     Uri uri = data.getData();
     if (req == 1) {
-      String name = "Clash 配置";
-      try (Cursor cursor =
-          getContentResolver()
-              .query(uri, new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
-        if (cursor != null && cursor.moveToFirst()) name = cursor.getString(0);
-      } catch (Exception ignored) {
-      }
-      work(name, () -> ConfigSource.read(getContentResolver().openInputStream(uri)));
+      work(() -> fileName(uri), () -> ConfigSource.read(getContentResolver().openInputStream(uri)));
     }
     if (req == 2) {
-      try {
-        String value;
-        if (pendingExport == 1) value = adapted;
-        else {
-          RelayService s = RelayService.instance;
-          value =
-              s != null
-                  ? s.report()
-                  : ConfigSource.read(
-                      new FileInputStream(new File(getFilesDir(), "relay-result.json")));
-        }
-        try (OutputStream out = getContentResolver().openOutputStream(uri, "wt")) {
-          out.write(value.getBytes("UTF-8"));
-        }
-        toast(pendingExport == 1 ? "已保存，请在 Clash 中导入" : "诊断已导出");
-      } catch (Exception e) {
-        toast("保存失败，请选择可写入的位置");
-      }
+      int kind = pendingExport;
+      io.execute(() -> saveExport(uri, kind));
     }
+  }
+
+  private void saveExport(Uri uri, int kind) {
+    String result;
+    try (OutputStream out = getContentResolver().openOutputStream(uri, "wt")) {
+      if (kind == 1) configFiles.copyAdapted(out);
+      else {
+        RelayService service = RelayService.instance;
+        String report =
+            service != null
+                ? service.report()
+                : ConfigSource.read(
+                    new FileInputStream(new File(getFilesDir(), "relay-result.json")));
+        out.write(report.getBytes(StandardCharsets.UTF_8));
+      }
+      result = kind == 1 ? "已保存，请在 Clash 中导入" : "诊断已导出";
+    } catch (Exception e) {
+      result = "保存失败，请选择可写入的位置";
+    }
+    String message = result;
+    runOnUiThread(
+        () -> {
+          if (!isDestroyed()) toast(message);
+        });
   }
 
   private void toast(String s) {
@@ -878,6 +953,10 @@ public final class MainActivity extends Activity {
   protected void onResume() {
     super.onResume();
     resumed = true;
+    if (page == 2 && backgroundButton != null) {
+      setTextIfChanged(backgroundButton, batteryExempt() ? "后台运行 · 已允许" : "允许后台运行");
+      if (RelayService.instance == null) savedEvents = null;
+    }
     handler.post(refresh);
   }
 
@@ -904,7 +983,9 @@ public final class MainActivity extends Activity {
 
   @Override
   protected void onDestroy() {
-    io.shutdownNow();
+    if (adaptation != null) adaptation.cancel(true);
+    // Let an export finish even if the system recreates the Activity while it writes.
+    io.shutdown();
     handler.removeCallbacksAndMessages(null);
     super.onDestroy();
   }

@@ -196,8 +196,9 @@ final class Design {
   static class Flow extends View {
     final Design d;
     final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
-    private final Path path = new Path();
-    private final PathMeasure pathMeasure = new PathMeasure();
+    private final Path[] paths = new Path[3];
+    private final PathMeasure[] measures = new PathMeasure[paths.length];
+    private final float[] lengths = new float[paths.length];
     private final float[] position = new float[2];
     float tint, phase;
     boolean active, moving;
@@ -206,10 +207,20 @@ final class Design {
     Flow(Context c, Design d) {
       super(c);
       this.d = d;
+      for (int i = 0; i < paths.length; i++) {
+        float x = 64 + i * 39;
+        Path path = new Path();
+        path.moveTo(x, 67);
+        path.cubicTo(x + 48, 67, x - 20, 173, x + 28, 173);
+        paths[i] = path;
+        measures[i] = new PathMeasure(path, false);
+        lengths[i] = measures[i].getLength();
+      }
       setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
     }
 
     void setState(boolean on, boolean busy) {
+      if (active == on && moving == busy) return;
       if (active != on) {
         active = on;
         if (transition != null) transition.cancel();
@@ -270,6 +281,7 @@ final class Design {
 
     protected void onDetachedFromWindow() {
       if (animator != null) animator.cancel();
+      animator = null;
       if (transition != null) transition.cancel();
       super.onDetachedFromWindow();
     }
@@ -288,22 +300,13 @@ final class Design {
       p.setStrokeCap(Paint.Cap.ROUND);
       int off = d.dark ? 0xFF648274 : 0xFFA6BCAD;
       p.setColor(blend(off, d.accent, tint));
-      for (int i = 0; i < 3; i++) {
-        float x = 64 + i * 39;
-        path.reset();
-        path.moveTo(x, 67);
-        path.cubicTo(x + 48, 67, x - 20, 173, x + 28, 173);
-        c.drawPath(path, p);
-        if (moving && d.animate()) {
-          PathMeasure m = pathMeasure;
-          m.setPath(path, false);
-          float[] xy = position;
-          m.getPosTan(((phase + i * .18f) % 1) * m.getLength(), xy, null);
-          p.setColor(d.dark ? 0xFFE4FFED : 0xFFB1D9B9);
-          p.setStyle(Paint.Style.FILL);
-          c.drawCircle(xy[0], xy[1], 4, p);
-          p.setStyle(Paint.Style.STROKE);
-          p.setColor(blend(off, d.accent, tint));
+      for (Path path : paths) c.drawPath(path, p);
+      if (animator != null) {
+        p.setColor(d.dark ? 0xFFE4FFED : 0xFFB1D9B9);
+        p.setStyle(Paint.Style.FILL);
+        for (int i = 0; i < measures.length; i++) {
+          measures[i].getPosTan(((phase + i * .18f) % 1) * lengths[i], position, null);
+          c.drawCircle(position[0], position[1], 4, p);
         }
       }
       c.restore();

@@ -18,8 +18,13 @@ import app.rill.core.Targets;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
+import java.util.Iterator;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -30,12 +35,20 @@ import org.json.JSONObject;
 public final class RelayService extends Service {
   private static final int NOTIFICATION_ID = 41;
   private static final String NOTIFICATION_CHANNEL = "relay";
+  private static final long ACTIVE_SAMPLE_MS = 10000, IDLE_SAMPLE_MS = 60000;
+  private static final int MAX_EVENTS = 200, MAX_SAMPLES = 900;
+  private static final int SNAPSHOT_EVENTS = 60, SNAPSHOT_SAMPLES = 24;
+  private static final Object DIAGNOSTIC_FILE_LOCK = new Object();
+  private static volatile long latestSessionId;
 
   public static volatile RelayService instance;
   private volatile String message = "服务未启动";
   public volatile RelayCore core;
-  private final ArrayList<String> history = new ArrayList<String>();
-  private final ArrayList<JSONObject> samples = new ArrayList<JSONObject>();
+  private final ArrayDeque<String> history = new ArrayDeque<>();
+  private final ArrayDeque<JSONObject> samples = new ArrayDeque<>();
+  private final SimpleDateFormat eventTime = new SimpleDateFormat("HH:mm:ss", Locale.ROOT);
+  private String cachedLogText;
+  private volatile int eventCount;
   private HandlerThread worker;
   private Handler handler;
   private BackgroundGuard guard;
@@ -45,14 +58,19 @@ public final class RelayService extends Service {
   private long nextStartAttempt;
   private volatile int startFailures;
   private long started, lastSample;
+  private long sessionId;
+  private RelayCore sampledCore;
+  private long sampledRequests, sampledDownloads, sampledServed;
+  private int sampledEvents;
   private volatile long lastTick;
   private volatile long maxTickGap;
   private volatile int recoveries;
   private String lastPowerState = "";
+  private JSONObject sampledPower;
   private String lastGuardError = "";
   private String lastNetworkError = "";
   private final LiveStats live = new LiveStats();
-  private String lastNotification = "";
+  private String notifiedConnections = "", notifiedDownload = "";
   private final Object notificationLock = new Object();
   // Created once per service session; all subsequent access holds notificationLock.
   private Notification.Builder notificationBuilder;
@@ -65,7 +83,6 @@ public final class RelayService extends Service {
   @Override
   public void onCreate() {
     super.onCreate();
-    instance = this;
     started = System.currentTimeMillis();
     NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
     nm.createNotificationChannel(
@@ -77,6 +94,8 @@ public final class RelayService extends Service {
     handler = new Handler(worker.getLooper());
     guard = new BackgroundGuard(this);
     wifiUpstream = new WifiUpstream(this, this::log);
+    sessionId = ++latestSessionId;
+    instance = this;
   }
 
   public boolean isSessionActive() {
@@ -129,19 +148,9 @@ public final class RelayService extends Service {
     return notificationBuilder.setContentText(notificationMetrics()).build();
   }
 
-  private String notificationKey() {
-    return live.connectionsText + "\n" + live.downloadText;
-  }
-
-  private void updateNotification() {
-    synchronized (notificationLock) {
-      if (stopping) return;
-      String value = notificationKey();
-      if (value.equals(lastNotification)) return;
-      ((NotificationManager) getSystemService(NOTIFICATION_SERVICE))
-          .notify(NOTIFICATION_ID, notification());
-      lastNotification = value;
-    }
+  private void rememberNotificationMetrics() {
+    notifiedConnections = live.connectionsText;
+    notifiedDownload = live.downloadText;
   }
 
   @Override
@@ -162,17 +171,16 @@ public final class RelayService extends Service {
         startForeground(
             NOTIFICATION_ID, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
       else startForeground(NOTIFICATION_ID, notification());
-      lastNotification = notificationKey();
+      rememberNotificationMetrics();
       sessionActive = true;
     }
-    try {
-      guard.maintain();
-    } catch (Exception e) {
-      log("后台运行保护未生效：" + RelayCore.safe(e));
-    }
     if (intent == null) log("系统回收后恢复加速会话");
-    handler.removeCallbacks(tick);
-    handler.post(tick);
+    // Replace the next tick on its own looper, including when a start arrives during a tick.
+    handler.post(
+        () -> {
+          handler.removeCallbacks(tick);
+          tick.run();
+        });
     return START_STICKY;
   }
 
@@ -188,7 +196,26 @@ public final class RelayService extends Service {
     RelayCore c =
         new RelayCore(
             wifiUpstream::open,
-            s -> log(s),
+            new RelayCore.Events() {
+              @Override
+              public void event(String message) {
+                log(message);
+              }
+
+              @Override
+              public void requestStarted() {
+                try {
+                  guard.requestStarted();
+                } catch (RuntimeException ignored) {
+                  // The maintenance tick retries and reports a persistent lock failure.
+                }
+              }
+
+              @Override
+              public void requestFinished() {
+                guard.requestFinished();
+              }
+            },
             getSharedPreferences("rill", 0).getInt("connections", 8));
     try {
       c.setTargets(
@@ -229,8 +256,8 @@ public final class RelayService extends Service {
           try {
             long now = SystemClock.elapsedRealtime();
             if (lastTick > 0) maxTickGap = Math.max(maxTickGap, now - lastTick);
-            if (lastTick > 0 && now - lastTick > 5000)
-              log("后台调度中断 " + ((now - lastTick) / 1000) + " 秒后恢复");
+            boolean resumedAfterGap = lastTick > 0 && now - lastTick > 5000;
+            if (resumedAfterGap) log("后台调度中断 " + ((now - lastTick) / 1000) + " 秒后恢复");
             lastTick = now;
             try {
               guard.maintain();
@@ -251,31 +278,55 @@ public final class RelayService extends Service {
             ensureCore(now);
             RelayCore c = core;
             if (c == null || stopping) return;
+            long downloaded = c.downloaded.get();
+            int connections = c.connections.get();
             synchronized (notificationLock) {
               if (stopping) return;
-              live.sample(now, c.downloaded.get(), c.connections.get(), c.getConnectionLimit());
+              live.sample(now, downloaded, connections, c.getConnectionLimit());
               speed = live.downloadRate / 1000;
-              updateNotification();
+              if (!notifiedConnections.equals(live.connectionsText)
+                  || !notifiedDownload.equals(live.downloadText)) {
+                ((NotificationManager) getSystemService(NOTIFICATION_SERVICE))
+                    .notify(NOTIFICATION_ID, notification());
+                rememberNotificationMetrics();
+              }
             }
-            if (lastSample == 0 || now - lastSample >= 10000) {
+            long requests = c.requests.get(), served = c.served.get();
+            int events = eventCount;
+            boolean hasTraffic =
+                connections > 0
+                    || c.active.get() > 0
+                    || requests != sampledRequests
+                    || downloaded != sampledDownloads
+                    || served != sampledServed
+                    || events != sampledEvents;
+            if (sampledCore != c
+                || resumedAfterGap
+                || now - lastSample >= (hasTraffic ? ACTIVE_SAMPLE_MS : IDLE_SAMPLE_MS)) {
               lastSample = now;
+              sampledCore = c;
+              sampledRequests = requests;
+              sampledDownloads = downloaded;
+              sampledServed = served;
               JSONObject power = guard.report();
               String powerState = power.toString();
               if (!powerState.equals(lastPowerState)) {
                 log("后台状态 " + powerState);
                 lastPowerState = powerState;
+                sampledPower = power;
               }
+              sampledEvents = eventCount;
               JSONObject sample = new JSONObject();
               sample.put("time_ms", System.currentTimeMillis());
-              sample.put("downloaded_bytes", c.downloaded.get());
-              sample.put("served_bytes", c.served.get());
+              sample.put("downloaded_bytes", downloaded);
+              sample.put("served_bytes", served);
               sample.put("active_players", c.active.get());
-              sample.put("upstream_connections", c.connections.get());
+              sample.put("upstream_connections", connections);
               sample.put("retries", c.retries.get());
               sample.put("errors", c.errors.get());
-              sample.put("background", power);
+              sample.put("background", sampledPower);
               synchronized (samples) {
-                if (samples.size() >= 900) samples.remove(0);
+                if (samples.size() >= MAX_SAMPLES) samples.removeFirst();
                 samples.add(sample);
               }
               saveAsync();
@@ -291,24 +342,31 @@ public final class RelayService extends Service {
       };
 
   public void log(String s) {
-    String entry =
-        new java.text.SimpleDateFormat("HH:mm:ss", Locale.ROOT).format(new Date()) + "  " + s;
     synchronized (history) {
-      if (history.size() >= 200) history.remove(0);
-      history.add(entry);
+      if (history.size() >= MAX_EVENTS) history.removeFirst();
+      history.add(eventTime.format(new Date()) + "  " + s);
+      eventCount++;
+      cachedLogText = null;
     }
   }
 
   public String logText() {
     synchronized (history) {
-      StringBuilder b = new StringBuilder();
-      for (int i = Math.max(0, history.size() - 60); i < history.size(); i++)
-        b.append(history.get(i)).append('\n');
-      return b.toString();
+      if (cachedLogText == null) {
+        StringBuilder b = new StringBuilder();
+        int skip = Math.max(0, history.size() - 60);
+        for (String event : history) if (skip-- <= 0) b.append(event).append('\n');
+        cachedLogText = b.toString();
+      }
+      return cachedLogText;
     }
   }
 
   public String report() {
+    return report(true, MAX_EVENTS, MAX_SAMPLES);
+  }
+
+  private String report(boolean pretty, int eventLimit, int sampleLimit) {
     try {
       JSONObject j = new JSONObject();
       j.put("tool", "Rill " + BuildConfig.VERSION_NAME);
@@ -344,6 +402,7 @@ public final class RelayService extends Service {
         j.put("requests", c.requests.get());
         j.put("open_clients", c.getOpenClientCount());
         j.put("pending_preflights", c.getPendingPreflights());
+        j.put("cached_audio_bytes", c.getCachedBytes());
         j.put("downloaded_bytes", c.downloaded.get());
         j.put("served_bytes", c.served.get());
         j.put("retries", c.retries.get());
@@ -353,15 +412,24 @@ public final class RelayService extends Service {
         j.put("listener_alive", c.isListening());
       }
       synchronized (history) {
-        j.put("events", new JSONArray(history));
+        j.put("events", latest(history, eventLimit));
       }
       synchronized (samples) {
-        j.put("samples", new JSONArray(samples));
+        j.put("samples", latest(samples, sampleLimit));
       }
-      return j.toString(2);
+      return pretty ? j.toString(2) : j.toString();
     } catch (Exception e) {
       return "{}";
     }
+  }
+
+  private static JSONArray latest(ArrayDeque<?> entries, int limit) {
+    if (entries.size() <= limit) return new JSONArray(entries);
+    ArrayList<Object> tail = new ArrayList<>(limit);
+    Iterator<?> newest = entries.descendingIterator();
+    while (tail.size() < limit) tail.add(newest.next());
+    Collections.reverse(tail);
+    return new JSONArray(tail);
   }
 
   private void saveAsync() {
@@ -369,24 +437,24 @@ public final class RelayService extends Service {
     diagnostics.execute(
         () -> {
           try {
-            save();
+            save(SNAPSHOT_EVENTS, SNAPSHOT_SAMPLES);
           } finally {
             savePending.set(false);
           }
         });
   }
 
-  private void save() {
+  private void save(int eventLimit, int sampleLimit) {
+    byte[] value = report(false, eventLimit, sampleLimit).getBytes(StandardCharsets.UTF_8);
     try {
-      File temp = new File(getFilesDir(), "relay-result.tmp"),
-          dest = new File(getFilesDir(), "relay-result.json");
-      try (FileOutputStream out = new FileOutputStream(temp)) {
-        out.write(report().getBytes("UTF-8"));
-      }
-      if (!temp.renameTo(dest)) {
-        try (FileOutputStream out = new FileOutputStream(dest)) {
-          out.write(report().getBytes("UTF-8"));
+      synchronized (DIAGNOSTIC_FILE_LOCK) {
+        if (sessionId != latestSessionId) return;
+        File temp = new File(getFilesDir(), "relay-result.tmp"),
+            dest = new File(getFilesDir(), "relay-result.json");
+        try (FileOutputStream out = new FileOutputStream(temp)) {
+          out.write(value);
         }
+        if (!temp.renameTo(dest)) temp.delete();
       }
     } catch (Exception ignored) {
     }
@@ -414,7 +482,7 @@ public final class RelayService extends Service {
         () -> {
           try {
             if (core != null) core.close();
-            diagnostics.execute(this::save);
+            diagnostics.execute(() -> save(MAX_EVENTS, MAX_SAMPLES));
           } finally {
             diagnostics.shutdown();
             worker.quitSafely();
