@@ -16,6 +16,9 @@ public class RelayHttpTest {
           "GET / HTTP/1.1\r\nHost: one\r\nhost: two\r\n\r\n",
           "GET / HTTP/1.1\r\nBad Name: value\r\n\r\n",
           "GET / HTTP/1.1\r\nHost : value\r\n\r\n",
+          "GE\rT / HTTP/1.1\r\n\r\n",
+          "GET / HTTP/1.1\r\nHo\rst: localhost\r\n\r\n",
+          "GET / HTTP/1.1\r\n" + new String(new char[8193]).replace('\0', '\r') + "\n",
           "GET / HTTP/1.1\r\nHost: localhost\r\n",
           "GET /" + new String(new char[8192]).replace('\0', 'x') + " HTTP/1.1\r\n\r\n"
         }) {

@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 CERTIFICATE_SHA256 = "5f3d35c836f1b7c2c5bc14a6e7ecac6b9ce74fb6c83d2427998012d822b57840"
@@ -43,13 +44,14 @@ def main():
     windows = os.name == "nt"
     signer = build_tools / ("apksigner.bat" if windows else "apksigner")
     aapt = build_tools / ("aapt.exe" if windows else "aapt")
-    zipalign = build_tools / ("zipalign.exe" if windows else "zipalign")
+    zipalign = Path(args.sdk).resolve() / "build-tools" / "35.0.0" / (
+        "zipalign.exe" if windows else "zipalign")
     apk = ROOT / "app/build/outputs/apk/release/app-release.apk"
     certificate = run(str(signer), "verify", "--verbose", "--print-certs", str(apk))
     digest_match = re.search(r"Signer #1 certificate SHA-256 digest: ([0-9a-fA-F]+)", certificate)
     if not digest_match or digest_match[1].lower() != CERTIFICATE_SHA256:
         raise ValueError("Release certificate differs from the established Rill signing key")
-    run(str(zipalign), "-c", "4", str(apk))
+    run(str(zipalign), "-c", "-P", "16", "4", str(apk))
     badging = run(str(aapt), "dump", "badging", str(apk))
     package = re.search(r"^package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'",
                         badging, re.MULTILINE)
@@ -57,6 +59,10 @@ def main():
         raise ValueError("APK package/version differs from gradle.properties")
     if "application-debuggable" in badging:
         raise ValueError("Refusing to distribute a debuggable APK")
+    with zipfile.ZipFile(apk) as archive:
+        vcs = archive.read("META-INF/version-control-info.textproto").decode("utf-8")
+    if not re.search(r'^\s*revision:\s*"' + commit + r'"\s*$', vcs, re.MULTILINE):
+        raise ValueError("Rebuild the APK from the current Git commit before packaging")
     apk_sha256 = hashlib.sha256(apk.read_bytes()).hexdigest()
     output = ROOT / "app/build/outputs/releases" / version
     output.mkdir(parents=True, exist_ok=True)
@@ -70,6 +76,7 @@ def main():
         "source_commit": commit, "apk_sha256": apk_sha256,
         "certificate_sha256": CERTIFICATE_SHA256, "signature_verified": True,
         "zip_alignment_verified": True, "debuggable": False, "build_tools": "34.0.0",
+        "native_library_zip_alignment_kib": 16,
         "verified_at_utc": datetime.now(timezone.utc).isoformat(),
     }
     (output / "verification.json").write_text(

@@ -20,6 +20,32 @@ import org.junit.Test;
 
 public class RelayCoreTest {
   @Test
+  public void servesMatchedOriginOnTheTunnelSocketWithoutListening() throws Exception {
+    try (RelayCore relay = new RelayCore(RelayCoreTest::tinyTrack, message -> {});
+        ServerSocket fixture = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
+        Socket player = new Socket(InetAddress.getLoopbackAddress(), fixture.getLocalPort());
+        Socket tunnel = fixture.accept()) {
+      relay.setTargets(Targets.parse("example.com:8080"));
+      relay.start();
+      player.setSoTimeout(3000);
+      assertFalse(relay.isListening());
+      assertFalse(relay.serveHttp(tunnel, requestBytes("other.example:8080"), 8080));
+      assertFalse(relay.serveHttp(tunnel, requestBytes("example.com:8080"), 80));
+      assertTrue(relay.serveHttp(tunnel, requestBytes("example.com:8080"), 8080));
+      byte[] data = player.getInputStream().readAllBytes();
+      assertTrue(new String(data, StandardCharsets.ISO_8859_1).startsWith("HTTP/1.1 200"));
+      assertArrayEquals(
+          new byte[] {1, 2, 3, 4}, Arrays.copyOfRange(data, data.length - 4, data.length));
+      assertEquals(1, relay.requests.get());
+    }
+  }
+
+  private static InputStream requestBytes(String host) {
+    return new ByteArrayInputStream(
+        ("GET /audio HTTP/1.1\r\nHost: " + host + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+  }
+
+  @Test
   public void ignoresRangeForHeadAndStaleOrWeakIfRange() throws Exception {
     try (RelayCore relay = new RelayCore(RelayCoreTest::tinyTrack, message -> {})) {
       relay.setTargets(Targets.parse("example.com"));
@@ -37,6 +63,10 @@ public class RelayCoreTest {
       assertTrue(head.headers.contains("Content-Length: 4"));
       assertFalse(head.headers.contains("Content-Range:"));
       assertEquals(0, head.body.length);
+      Response invalidHead =
+          request(relay.getListeningPort(), "HEAD http://outside.example/audio HTTP/1.1\r\n\r\n");
+      assertTrue(invalidHead.headers.startsWith("HTTP/1.1 502"));
+      assertEquals(0, invalidHead.body.length);
     }
     try (RelayCore relay = new RelayCore(url -> tinyTrack(url, "W/\"weak\""), message -> {})) {
       relay.setTargets(Targets.parse("example.com"));
@@ -203,6 +233,47 @@ public class RelayCoreTest {
   }
 
   @Test
+  public void sharesAFailedProbeWithAllCurrentReadersThenAllowsANewAttempt() throws Exception {
+    AtomicInteger opens = new AtomicInteger();
+    CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
+    ExecutorService players = Executors.newFixedThreadPool(4);
+    try (RelayCore relay =
+        new RelayCore(
+            url -> {
+              if (opens.incrementAndGet() == 1) {
+                entered.countDown();
+                awaitPreflight(release);
+                throw new RelayCore.Fatal("first preflight failed");
+              }
+              return tinyTrack(url);
+            },
+            message -> {})) {
+      relay.setTargets(Targets.parse("example.com"));
+      relay.start(0);
+      int port = relay.getListeningPort();
+      String next = "GET http://example.com/next HTTP/1.1\r\n\r\n";
+      List<Future<Response>> readers = new ArrayList<>();
+      readers.add(players.submit(() -> request(port, next)));
+      assertTrue(entered.await(2, TimeUnit.SECONDS));
+      for (int i = 1; i < 4; i++) readers.add(players.submit(() -> request(port, next)));
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+      while (relay.requests.get() < 4 && System.nanoTime() < deadline) Thread.sleep(10);
+      assertEquals(4, relay.requests.get());
+      // Keep the first response blocked while the admitted readers join its preflight.
+      Thread.sleep(100);
+      release.countDown();
+      for (Future<Response> reader : readers)
+        assertTrue(reader.get(3, TimeUnit.SECONDS).headers.startsWith("HTTP/1.1 502"));
+      assertEquals(1, opens.get());
+      assertArrayEquals(new byte[] {1, 2, 3, 4}, request(port, next).body);
+      assertEquals(2, opens.get());
+    } finally {
+      release.countDown();
+      players.shutdownNow();
+    }
+  }
+
+  @Test
   public void retriesTransientTrackPreflightFailure() throws Exception {
     AtomicInteger attempts = new AtomicInteger();
     AtomicInteger closedResponses = new AtomicInteger();
@@ -217,6 +288,52 @@ public class RelayCoreTest {
       assertEquals(1, closedResponses.get());
       assertEquals(1, relay.retries.get());
       assertEquals(0, relay.connections.get());
+    }
+  }
+
+  @Test
+  public void retriesAStalledFirstProbeBeforeTheNormalReadTimeout() throws Exception {
+    HttpServer upstream = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    ExecutorService workers = Executors.newCachedThreadPool();
+    AtomicInteger probes = new AtomicInteger();
+    CountDownLatch releaseFirst = new CountDownLatch(1);
+    upstream.setExecutor(workers);
+    upstream.createContext(
+        "/next",
+        exchange -> {
+          try {
+            if (probes.incrementAndGet() == 1) {
+              releaseFirst.await();
+              return;
+            }
+            exchange.getResponseHeaders().add("Content-Range", "bytes 0-3/4");
+            exchange.sendResponseHeaders(206, 4);
+            exchange.getResponseBody().write(new byte[] {1, 2, 3, 4});
+          } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+          } finally {
+            exchange.close();
+          }
+        });
+    upstream.start();
+    try (RelayCore relay =
+        new RelayCore(url -> (HttpURLConnection) url.openConnection(Proxy.NO_PROXY), msg -> {})) {
+      String origin = "http://127.0.0.1:" + upstream.getAddress().getPort();
+      relay.setTargets(Targets.parse(origin));
+      relay.start(0);
+      Future<Response> next =
+          workers.submit(
+              () -> request(relay.getListeningPort(), "GET " + origin + "/next HTTP/1.1\r\n\r\n"));
+      Response response = next.get(8, TimeUnit.SECONDS);
+      assertTrue(response.headers.startsWith("HTTP/1.1 200"));
+      assertArrayEquals(new byte[] {1, 2, 3, 4}, response.body);
+      assertEquals(2, probes.get());
+      assertEquals(1, relay.retries.get());
+      assertEquals(0, relay.connections.get());
+    } finally {
+      releaseFirst.countDown();
+      upstream.stop(0);
+      workers.shutdownNow();
     }
   }
 
@@ -237,6 +354,47 @@ public class RelayCoreTest {
     }
   }
 
+  @Test
+  public void honorsAnExplicitUpstreamRetryDelay() throws Exception {
+    AtomicInteger opened = new AtomicInteger();
+    try (RelayCore relay =
+        new RelayCore(
+            url -> {
+              opened.incrementAndGet();
+              return new HttpURLConnection(url) {
+                @Override
+                public int getResponseCode() {
+                  return 503;
+                }
+
+                @Override
+                public String getHeaderField(String name) {
+                  return "Retry-After".equals(name) ? "60" : null;
+                }
+
+                @Override
+                public void disconnect() {}
+
+                @Override
+                public boolean usingProxy() {
+                  return false;
+                }
+
+                @Override
+                public void connect() {}
+              };
+            },
+            message -> {})) {
+      relay.setTargets(Targets.parse("example.com"));
+      relay.start(0);
+      Response response =
+          request(relay.getListeningPort(), "GET http://example.com/track HTTP/1.1\r\n\r\n");
+      assertTrue(response.headers.startsWith("HTTP/1.1 502"));
+      assertEquals(1, opened.get());
+      assertEquals(0, relay.retries.get());
+    }
+  }
+
   private static RelayCore preflightFixture(
       AtomicInteger attempts, AtomicInteger closedResponses, boolean rejected) {
     return new RelayCore(
@@ -248,6 +406,8 @@ public class RelayCoreTest {
                   if (rejected) return 403;
                   throw new EOFException("Transient connection loss");
                 }
+                assertEquals(8000, getConnectTimeout());
+                assertEquals(10000, getReadTimeout());
                 return 206;
               }
 
@@ -447,6 +607,49 @@ public class RelayCoreTest {
           trackBytes(block, 32), trackRange(relay.getListeningPort(), block, block + 31).body);
       assertEquals(2, attempts.get());
       assertEquals(1, relay.retries.get());
+    }
+  }
+
+  @Test
+  public void sendsValidatedPrefixWhileTheRemainingStartupBlocksArePending() throws Exception {
+    int size = RelayCore.BLOCK * 2;
+    CountDownLatch blocked = new CountDownLatch(1), release = new CountDownLatch(1);
+    CountDownLatch delivered = new CountDownLatch(1);
+    ExecutorService client = Executors.newSingleThreadExecutor();
+    try (RelayCore relay =
+        new RelayCore(
+            url ->
+                rangedTrack(
+                    url,
+                    size,
+                    range -> {
+                      if (range[0] >= 65536) {
+                        blocked.countDown();
+                        awaitPreflight(release);
+                      }
+                      return new ByteArrayInputStream(
+                          trackBytes((int) range[0], (int) (range[1] - range[0] + 1)));
+                    }),
+            message -> {
+              if (message.startsWith("首批音频")) delivered.countDown();
+            })) {
+      relay.setTargets(Targets.parse("example.com"));
+      relay.start(0);
+      Future<Response> response =
+          client.submit(() -> trackRange(relay.getListeningPort(), 0, size - 1));
+      try {
+        assertTrue(blocked.await(3, TimeUnit.SECONDS));
+        assertTrue(
+            "Validated prefix did not reach the client", delivered.await(3, TimeUnit.SECONDS));
+      } finally {
+        release.countDown();
+      }
+      Response complete = response.get(10, TimeUnit.SECONDS);
+      assertTrue(complete.headers.startsWith("HTTP/1.1 206"));
+      assertArrayEquals(trackBytes(0, size), complete.body);
+    } finally {
+      release.countDown();
+      client.shutdownNow();
     }
   }
 

@@ -24,7 +24,7 @@ import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -39,6 +39,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
@@ -58,12 +59,11 @@ public final class RelayCore implements Closeable {
     default void requestFinished() {}
   }
 
-  public static final String HOST = "lgf.audio.tidal.com";
   public static final int PORT = 18889, BLOCK = 256 * 1024, WINDOW = 12, MAX_BLOCKS = 48;
-  private static final int START_BUFFER = 512 * 1024;
-  // An unaligned START_BUFFER spans at most three blocks.
-  private static final int START_WINDOW = START_BUFFER / BLOCK + 1;
+  private static final int START_WINDOW = 3;
   private static final int RECENT_BLOCKS = 4;
+  private static final int FIRST_PROBE_TIMEOUT_MS = 3500;
+  private static final int CONNECT_TIMEOUT_MS = 8000, READ_TIMEOUT_MS = 10000;
   private static final Pattern CONTENT_RANGE = Pattern.compile("bytes (\\d+)-(\\d+)/(\\d+)");
   private final Opener opener;
   private final Events events;
@@ -91,7 +91,7 @@ public final class RelayCore implements Closeable {
   private final Map<Socket, Client> clientsBySocket = new ConcurrentHashMap<>();
   private final LinkedHashMap<String, Job> jobs = new LinkedHashMap<String, Job>(4, .75f, true);
   // Guarded by jobs; reserve capacity before doing I/O, coalescing only identical URLs.
-  private final Set<String> creating = new HashSet<>();
+  private final Map<String, PendingProbe> creating = new HashMap<>();
   public final AtomicLong downloaded = new AtomicLong(),
       served = new AtomicLong(),
       requests = new AtomicLong(),
@@ -176,7 +176,7 @@ public final class RelayCore implements Closeable {
     server = new ServerSocket();
     server.setReuseAddress(true);
     server.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), port), 8);
-    running = true;
+    start();
     listener =
         new Thread(
             new Runnable() {
@@ -210,6 +210,11 @@ public final class RelayCore implements Closeable {
             "Rill-listener");
     listener.setDaemon(true);
     listener.start();
+    log("本地服务已启动 · 127.0.0.1:" + port);
+  }
+
+  public void start() {
+    running = true;
     timer.scheduleWithFixedDelay(
         new Runnable() {
           public void run() {
@@ -231,13 +236,36 @@ public final class RelayCore implements Closeable {
         5,
         5,
         TimeUnit.SECONDS);
-    log("本地服务已启动 · 127.0.0.1:" + port);
   }
 
-  public URL allowed(String target, String host) throws IOException {
+  URL allowed(String target, String host) throws IOException {
     URL u = new URL(target.startsWith("/") ? "http://" + host + target : target);
     if (!targets.allows(u)) throw new IOException("请求不在已设置的 HTTP 加速链接中");
     return u;
+  }
+
+  /** Serves a matched request directly on the tunnel socket. The caller can rewind on mismatch. */
+  public boolean serveHttp(Socket socket, InputStream input, int port) throws IOException {
+    Request request;
+    URL url;
+    try {
+      request = parse(input);
+      if (request == null || !(request.method.equals("GET") || request.method.equals("HEAD")))
+        return false;
+      url = allowed(request.target, request.headers.getOrDefault("host", ""));
+      if ((url.getPort() == -1 ? 80 : url.getPort()) != port) return false;
+    } catch (IOException e) {
+      return false;
+    }
+    Client client = new Client(socket);
+    socket.setSoTimeout(0);
+    clientsBySocket.put(socket, client);
+    if (!running) {
+      clientsBySocket.remove(socket);
+      throw new IOException("服务已停止");
+    }
+    handle(client, request, url);
+    return true;
   }
 
   private final class Client implements Runnable {
@@ -250,32 +278,24 @@ public final class RelayCore implements Closeable {
 
     @Override
     public void run() {
-      handle(this);
+      handle(this, null, null);
     }
   }
 
-  private void handle(Client client) {
+  private void handle(Client client, Request request, URL matchedUrl) {
     Socket socket = client.socket;
-    boolean sent = false, requestStarted = false;
+    boolean sent = false, requestStarted = false, head = false;
     Job job = null;
     Reader reader = null;
     OutputStream out = null;
     try {
-      InputStream in = new BufferedInputStream(socket.getInputStream(), 8192);
       out = socket.getOutputStream();
-      Request r = parse(in);
+      Request r =
+          request == null ? parse(new BufferedInputStream(socket.getInputStream())) : request;
       if (r == null) return;
-      if (r.method.equals("CONNECT")) {
-        if (!targets.tunnel(r.target)) {
-          error(out, 501, "仅支持已设置的 HTTP 取流，不支持 HTTPS 隧道");
-          return;
-        }
-        out.write("HTTP/1.1 200 Connection Established\r\n\r\n".getBytes("US-ASCII"));
-        out.flush();
-        r = parse(in);
-        if (r == null) return;
-      }
-      if (r.target.equals("/health")
+      head = r.method.equals("HEAD");
+      if (request == null
+          && r.target.equals("/health")
           && "GET".equals(r.method)
           && r.headers
               .getOrDefault("host", "")
@@ -283,26 +303,29 @@ public final class RelayCore implements Closeable {
         error(out, 200, "Rill ready");
         return;
       }
-      if (!r.method.equals("GET") && !r.method.equals("HEAD")) {
+      if (!r.method.equals("GET") && !head) {
         error(out, 405, "仅支持 GET / HEAD");
         return;
       }
       if (r.headers.containsKey("transfer-encoding")
           || !r.headers.getOrDefault("content-length", "0").equals("0")) {
-        error(out, 400, "不支持请求正文");
+        error(out, 400, "不支持请求正文", head);
         return;
       }
-      URL url = allowed(r.target, r.headers.getOrDefault("host", HOST));
+      URL url =
+          matchedUrl == null ? allowed(r.target, r.headers.getOrDefault("host", "")) : matchedUrl;
+      long requestedAt = now();
       requestStarted = true;
       events.requestStarted();
       requests.incrementAndGet();
       client.lastActivity = now();
       job = acquire(url);
+      long metadataAt = now();
       format = job.format;
       String requestedRange = r.headers.get("range");
       // Evaluate conditions before parsing Range: a stale validator requires the full body.
       String validator = r.headers.get("if-range");
-      if (!r.method.equals("GET")
+      if (head
           || validator != null
               && (validator.startsWith("W/")
                   || !(validator.equals(job.etag) || validator.equals(job.modified)))) {
@@ -319,7 +342,7 @@ public final class RelayCore implements Closeable {
       if (job.etag != null) h.put("ETag", job.etag);
       if (job.modified != null) h.put("Last-Modified", job.modified);
       if (partial) h.put("Content-Range", "bytes " + start + "-" + end + "/" + job.size);
-      if (r.method.equals("HEAD")) {
+      if (head) {
         send(out, partial ? 206 : 200, partial ? "Partial Content" : "OK", h);
         sent = true;
         return;
@@ -328,18 +351,30 @@ public final class RelayCore implements Closeable {
       active.incrementAndGet();
       state = "正在缓冲 · " + job.id;
       log("播放请求 " + job.id + " · 起点 " + start + " · " + job.format);
-      // Do not commit successful response headers until upstream supplied validated bytes.
-      reader.prefill();
-      state = "正在加速 · " + job.id;
       byte[] buffer = new byte[(int) Math.min(64 * 1024, end - start + 1)];
+      // Wait only for the first validated bytes of this range. The player buffers the rest.
       int n = reader.read(buffer, 0);
+      state = "正在加速 · " + job.id;
       send(out, partial ? 206 : 200, partial ? "Partial Content" : "OK", h);
       sent = true;
+      boolean firstWrite = true;
       while (n != -1 && running) {
         client.lastActivity = now();
         out.write(buffer, 0, n);
         served.addAndGet(n);
         client.lastActivity = now();
+        if (firstWrite) {
+          firstWrite = false;
+          if (job.firstDelivery.compareAndSet(false, true))
+            log(
+                "首批音频 "
+                    + job.id
+                    + " · 请求至交付 "
+                    + (client.lastActivity - requestedAt)
+                    + " ms · 获取元数据 "
+                    + (metadataAt - requestedAt)
+                    + " ms");
+        }
         n = reader.read(buffer, n);
       }
       out.flush();
@@ -362,7 +397,7 @@ public final class RelayCore implements Closeable {
           log("请求结束：" + msg);
         }
         try {
-          if (!sent && out != null) error(out, 502, msg);
+          if (!sent && out != null) error(out, 502, msg, head);
         } catch (IOException ignored) {
         }
       }
@@ -384,34 +419,40 @@ public final class RelayCore implements Closeable {
     return RelayHttp.range(value, size);
   }
 
+  // Called with jobs held.
   private Job retainJob(String key) throws IOException {
-    synchronized (jobs) {
-      if (!running) throw new IOException("服务已停止");
-      Job job = jobs.get(key);
-      if (job == null) return null;
-      if (job.closed || job.failure != null) {
-        job.close();
-        jobs.remove(key);
-        return null;
-      }
-      job.references++;
-      return job;
+    if (!running) throw new IOException("服务已停止");
+    Job job = jobs.get(key);
+    if (job == null) return null;
+    if (job.closed || job.failure != null) {
+      job.close();
+      jobs.remove(key);
+      return null;
     }
+    job.references++;
+    return job;
+  }
+
+  private static final class PendingProbe {
+    IOException failure;
   }
 
   private Job acquire(URL url) throws IOException {
     String key = url.toString();
+    PendingProbe mine;
     synchronized (jobs) {
       while (true) {
         Job cached = retainJob(key);
         if (cached != null) return cached;
-        if (creating.contains(key)) {
+        PendingProbe pending = creating.get(key);
+        if (pending != null) {
           try {
-            jobs.wait();
+            while (running && creating.get(key) == pending) jobs.wait();
           } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("取流已取消", e);
           }
+          if (pending.failure != null) throw pending.failure;
           continue;
         }
         if (jobs.size() + creating.size() >= 2) {
@@ -426,11 +467,12 @@ public final class RelayCore implements Closeable {
           }
         }
         if (jobs.size() + creating.size() >= 2) throw new IOException("同时播放的音频过多，请停止旧播放后重试");
-        creating.add(key);
+        mine = new PendingProbe();
+        creating.put(key, mine);
         break;
       }
     }
-    boolean reserved = true;
+    IOException failure = null;
     try {
       Job created = createJob(url);
       synchronized (jobs) {
@@ -440,13 +482,19 @@ public final class RelayCore implements Closeable {
         }
         created.references++;
         creating.remove(key);
-        reserved = false;
         jobs.put(key, created);
         return created;
       }
+    } catch (IOException e) {
+      failure = e;
+      throw e;
+    } catch (RuntimeException e) {
+      failure = new IOException("音频预检失败：" + e.getClass().getSimpleName(), e);
+      throw failure;
     } finally {
       synchronized (jobs) {
-        if (reserved) creating.remove(key);
+        mine.failure = failure;
+        creating.remove(key, mine);
         jobs.notifyAll();
       }
     }
@@ -473,13 +521,22 @@ public final class RelayCore implements Closeable {
   private Job createJob(URL url) throws IOException {
     for (int attempt = 1; ; attempt++) {
       if (!running || Thread.currentThread().isInterrupted()) throw new IOException("取流已取消");
+      long started = now();
       try {
-        return new Job(url);
+        // A stalled first probe otherwise delays the player's next-track startup by 10 seconds.
+        return new Job(url, attempt == 1 ? FIRST_PROBE_TIMEOUT_MS : READ_TIMEOUT_MS);
       } catch (Fatal e) {
         throw e;
       } catch (IOException e) {
         if (attempt >= 3 || !running) throw e;
         retries.incrementAndGet();
+        log(
+            "音频预检重试 · 第 "
+                + attempt
+                + " 次耗时 "
+                + (now() - started)
+                + " ms · "
+                + e.getClass().getSimpleName());
         try {
           Thread.sleep(250L * attempt);
         } catch (InterruptedException interrupted) {
@@ -498,7 +555,8 @@ public final class RelayCore implements Closeable {
   }
 
   private HttpURLConnection open(
-      URL url, long first, long last, long size, String tag, String modified) throws IOException {
+      URL url, long first, long last, long size, String tag, String modified, int readTimeout)
+      throws IOException {
     reserveConnection();
     HttpURLConnection c;
     try {
@@ -525,8 +583,8 @@ public final class RelayCore implements Closeable {
     }
     int status = -1;
     try {
-      c.setConnectTimeout(8000);
-      c.setReadTimeout(10000);
+      c.setConnectTimeout(Math.min(CONNECT_TIMEOUT_MS, readTimeout));
+      c.setReadTimeout(readTimeout);
       c.setInstanceFollowRedirects(false);
       c.setUseCaches(false);
       c.setRequestProperty("Range", "bytes=" + first + "-" + last);
@@ -535,6 +593,9 @@ public final class RelayCore implements Closeable {
       if (tag != null && !tag.startsWith("W/")) c.setRequestProperty("If-Range", tag);
       else if (modified != null) c.setRequestProperty("If-Range", modified);
       status = c.getResponseCode();
+      if ((status == 502 || status == 503 || status == 504)
+          && c.getHeaderField("Retry-After") == null)
+        throw new IOException("上游暂时不可用，HTTP " + status);
       if (status != 206) throw new Fatal("上游 HTTP " + status + "，分段未获授权或未被接受");
       Matcher m = CONTENT_RANGE.matcher(String.valueOf(c.getHeaderField("Content-Range")));
       if (!m.matches()
@@ -606,17 +667,18 @@ public final class RelayCore implements Closeable {
     final LinkedHashMap<Integer, Block> blocks = new LinkedHashMap<>(16, .75f, true);
     final Map<Integer, Integer> wanted = new LinkedHashMap<>();
     final List<Reader> readers = new ArrayList<Reader>();
+    final AtomicBoolean firstDelivery = new AtomicBoolean();
     volatile boolean closed;
     volatile String failure;
     int references;
     long lastUsed = now();
 
-    Job(URL u) throws IOException {
+    Job(URL u, int probeTimeout) throws IOException {
       url = u;
       id = hash(u.toString().getBytes("UTF-8")).substring(0, 8);
       HttpURLConnection c = null;
       try {
-        c = open(url, 0, 65535, 0, null, null);
+        c = open(url, 0, 65535, 0, null, null, probeTimeout);
         size = Long.parseLong(c.getHeaderField("Content-Range").split("/")[1]);
         if (size < 1 || size > 2147483647L) throw new Fatal("暂不支持此音频大小");
         etag = c.getHeaderField("ETag");
@@ -757,7 +819,7 @@ public final class RelayCore implements Closeable {
           IOException error;
           try {
             long start = (long) index * BLOCK;
-            c = open(url, start + offset, start + end - 1, size, etag, modified);
+            c = open(url, start + offset, start + end - 1, size, etag, modified, READ_TIMEOUT_MS);
             try (InputStream in = c.getInputStream()) {
               while (offset < end) {
                 int n = in.read(data, offset, Math.min(16384, end - offset));
@@ -794,7 +856,7 @@ public final class RelayCore implements Closeable {
             if (error instanceof Fatal) {
               fail(error.getMessage());
             } else if (attempt == 2) {
-              fail("音频片段重试 3 次失败，请检查 Wi-Fi 或重新播放");
+              fail("音频片段重试 3 次失败，请检查网络或重新播放");
             }
           }
           if (error instanceof Fatal) log(error.getMessage());
@@ -853,30 +915,6 @@ public final class RelayCore implements Closeable {
     int lookahead(int limit) {
       int growth = (int) Math.min(4, (position - start) / BLOCK);
       return Math.min(limit, START_WINDOW << growth);
-    }
-
-    void prefill() throws IOException {
-      synchronized (job) {
-        long target = Math.min(START_BUFFER, end - position + 1), until = now() + 40000;
-        while (true) {
-          if (!running || closed || job.closed || job.failure != null)
-            throw new IOException(job.failure != null ? job.failure : "播放已取消");
-          long p = position, available = 0;
-          while (available < target) {
-            Block b = job.blocks.get((int) (p / BLOCK));
-            int offset = (int) (p % BLOCK);
-            if (b == null || b.valid <= offset) break;
-            int n = (int) Math.min(target - available, b.valid - offset);
-            p += n;
-            available += n;
-            if (b.valid < b.length) break;
-          }
-          if (available >= target) return;
-          long left = until - now();
-          if (left <= 0) throw new IOException("启动缓冲超时");
-          awaitBlock((int) (p / BLOCK), left);
-        }
-      }
     }
 
     int read(byte[] out, int delivered) throws IOException {

@@ -6,3 +6,5 @@
 gradlew text eol=lf
 *.bat text eol=crlf
 *.jar binary
+*.aar binary
+licenses/*-LICENSE.txt -whitespace

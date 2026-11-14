@@ -43,6 +43,14 @@ class Origin(http.server.BaseHTTPRequestHandler):
             self.send_error(416)
             return
         first, last = map(int, match.groups())
+        if ((self.path == "/transient-probe" and first == 0 and last == 65535)
+                or (self.path == "/transient-block" and first != 0)):
+            with self.server.fault_lock:
+                inject = self.path not in self.server.injected_faults
+                self.server.injected_faults.add(self.path)
+            if inject:
+                self.send_error(503)
+                return
         last = min(last, len(DATA) - 1)
         self.send_response(206)
         self.send_header("Content-Range", f"bytes {first}-{last}/{len(DATA)}")
@@ -68,9 +76,12 @@ class Matrix:
         self.results = []
         self.counter = 0
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Origin)
+        self.server.fault_lock = threading.Lock()
+        self.server.injected_faults = set()
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.forward = None
         self.original_restricted_mode = None
+        self.original_mobile_data = None
 
     def adb(self, *args, data=None, check=True):
         result = subprocess.run([self.args.adb, "-s", self.args.serial, *args], input=data,
@@ -89,7 +100,7 @@ class Matrix:
         except (ValueError, KeyError, subprocess.SubprocessError):
             return {}
 
-    def request(self, path=None, timeout=15, slow=False):
+    def request(self, path=None, timeout=15, slow=False, progress=None):
         self.counter += 1
         if path is None:
             path = f"/track/{self.counter}"
@@ -109,6 +120,8 @@ class Matrix:
                     break
                 digest.update(chunk)
                 received += len(chunk)
+                if progress is not None:
+                    progress(received)
                 if slow:
                     time.sleep(0.04)
             assert response.status == 206, f"HTTP {response.status}"
@@ -177,9 +190,18 @@ class Matrix:
                 RELEASE.set()
                 blocked.result(timeout=35)
 
+    def upstream_transient_recovery(self):
+        probe = self.request("/transient-probe")
+        block = self.request("/transient-block")
+        assert self.server.injected_faults == {"/transient-probe", "/transient-block"}
+        self.health()
+        return {"probe": probe, "block": block}
+
     def wifi_reconnect(self):
-        self.shell("svc wifi disable")
+        previous = self.shell("settings get global mobile_data")
+        self.shell("svc data disable")
         try:
+            self.shell("svc wifi disable")
             self.health()
             with concurrent.futures.ThreadPoolExecutor() as pool:
                 pending = pool.submit(self.request, None, 45)
@@ -190,6 +212,100 @@ class Matrix:
             return {"pending_transfer": transfer, "after_reconnect": self.request()}
         finally:
             self.shell("svc wifi enable")
+            self.restore_mobile_data(previous)
+
+    def restore_mobile_data(self, previous):
+        if previous in ("0", "1"):
+            self.shell("svc data " + ("enable" if previous == "1" else "disable"))
+
+    def cellular_handover(self):
+        def wait_for_transport(transport):
+            deadline = time.monotonic() + 25
+            while time.monotonic() < deadline:
+                network = self.report().get("network", {})
+                if network.get("available") and network.get("transport") == transport:
+                    return network
+                time.sleep(1)
+            raise AssertionError(f"Rill did not select {transport}: {network}")
+
+        previous = self.shell("settings get global mobile_data")
+        before_pid = self.shell("pidof app.rill.android")
+        assert before_pid.isdigit()
+        try:
+            self.shell("svc data disable")
+            wait_for_transport("wifi")
+            before = self.request()
+            self.shell("input keyevent 223")
+            self.shell("svc data enable")
+            self.shell("svc wifi disable")
+            assert wait_for_transport("cellular")["metered"]
+            cellular = self.request()
+            self.shell("svc wifi enable")
+            self.shell("cmd wifi connect-network AndroidWifi open")
+            self.shell("svc data disable")
+            wait_for_transport("wifi")
+            after = self.request()
+            assert self.shell("pidof app.rill.android") == before_pid
+            return {"wifi_before": before, "cellular": cellular, "wifi_after": after}
+        finally:
+            self.shell("svc wifi enable")
+            self.restore_mobile_data(previous)
+            self.shell("input keyevent 224")
+
+    def active_handover(self):
+        def wait_for_transport(transport):
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                network = self.report().get("network", {})
+                if network.get("transport") == transport and network.get("available") == (transport != "none"):
+                    return
+                time.sleep(.4)
+            raise AssertionError(f"Rill did not select {transport}: {network}")
+
+        previous = self.shell("settings get global mobile_data")
+        original_pid = self.shell("pidof app.rill.android")
+        assert original_pid.isdigit()
+        reached = [threading.Event() for _ in range(3)]
+        thresholds = [2, 8, 14]
+
+        def progress(received):
+            for mib, event in zip(thresholds, reached):
+                if received >= mib * 1024 * 1024:
+                    event.set()
+
+        def still_streaming(index):
+            assert reached[index].wait(35), f"Stream did not reach {thresholds[index]} MiB"
+            assert not transfer.done(), "The stream ended before the network changed"
+
+        try:
+            self.shell("svc wifi enable")
+            self.shell("cmd wifi connect-network AndroidWifi open")
+            self.shell("svc data disable")
+            wait_for_transport("wifi")
+            self.shell("input keyevent 223")
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                transfer = pool.submit(self.request, "/active-handover", 30, True, progress)
+                still_streaming(0)
+                self.shell("svc data enable")
+                self.shell("svc wifi disable")
+                wait_for_transport("cellular")
+                still_streaming(1)
+                self.shell("svc wifi enable")
+                self.shell("cmd wifi connect-network AndroidWifi open")
+                self.shell("svc data disable")
+                wait_for_transport("wifi")
+                still_streaming(2)
+                self.shell("svc wifi disable")
+                time.sleep(6)
+                self.shell("svc data enable")
+                wait_for_transport("cellular")
+                result = transfer.result(timeout=100)
+            assert self.shell("pidof app.rill.android") == original_pid
+            return result
+        finally:
+            self.shell("svc wifi enable")
+            self.restore_mobile_data(previous)
+            self.shell("input keyevent 224")
 
     def doze(self, exempt):
         self.shell(f"dumpsys deviceidle whitelist {'+' if exempt else '-'}app.rill.android")
@@ -211,6 +327,32 @@ class Matrix:
         finally:
             self.shell("dumpsys deviceidle unforce")
             self.shell("input keyevent 224")
+
+    def revoke_battery_exemption(self):
+        before_pid = self.shell("pidof app.rill.android")
+        assert before_pid.isdigit()
+
+        def wait_for_exemption(expected):
+            deadline = time.monotonic() + 16
+            while time.monotonic() < deadline:
+                snapshot = self.report()
+                if snapshot.get("background", {}).get("battery_exempt") is expected:
+                    return snapshot
+                time.sleep(.5)
+            raise AssertionError(f"Rill did not record battery_exempt={expected}")
+
+        self.shell("dumpsys deviceidle whitelist +app.rill.android")
+        self.request("/before-exemption-revoked")
+        wait_for_exemption(True)
+        self.shell("input keyevent 223")
+        self.shell("dumpsys deviceidle whitelist -app.rill.android")
+        transfer = self.request("/after-exemption-revoked")
+        snapshot = wait_for_exemption(False)
+        transport = snapshot["network"]["transport"]
+        if getattr(self.args, "start_cellular", False):
+            assert transport == "cellular"
+        assert self.shell("pidof app.rill.android") == before_pid
+        return {"same_process": True, "battery_exempt": False, "transport": transport, "transfer": transfer}
 
     def restart(self):
         before = self.shell("pidof app.rill.android")
@@ -274,7 +416,7 @@ class Matrix:
             deadline = time.monotonic() + 18
             while time.monotonic() < deadline:
                 report = self.report()
-                if report.get("wifi", {}).get("blocked"):
+                if report.get("network", report.get("wifi", {})).get("blocked"):
                     break
                 time.sleep(1)
             else:
@@ -316,13 +458,18 @@ class Matrix:
         prefs = f'''<?xml version="1.0" encoding="utf-8"?><map>
 <string name="targets">http://10.0.2.2:{self.server.server_port}</string>
 <boolean name="notifications_asked" value="true"/>
-<boolean name="background_asked" value="true"/>
 <boolean name="relay_enabled" value="false"/>
 </map>'''
         self.shell("run-as app.rill.android sh -c 'mkdir -p shared_prefs && cat > shared_prefs/rill.xml'", data=prefs.encode())
         self.shell("pm grant app.rill.android android.permission.POST_NOTIFICATIONS")
-        self.shell("svc wifi enable")
-        self.shell("cmd wifi connect-network AndroidWifi open")
+        self.shell("cmd appops set app.rill.android ACTIVATE_VPN allow")
+        if getattr(self.args, "start_cellular", False):
+            self.original_mobile_data = self.shell("settings get global mobile_data")
+            self.shell("svc data enable")
+            self.shell("svc wifi disable")
+        else:
+            self.shell("svc wifi enable")
+            self.shell("cmd wifi connect-network AndroidWifi open")
         self.shell("am start -W -n app.rill.android/.MainActivity")
         self.shell("uiautomator dump /sdcard/rill-test-ui.xml")
         tree = ET.fromstring(self.shell("cat /sdcard/rill-test-ui.xml"))
@@ -337,7 +484,9 @@ class Matrix:
     def run(self):
         try:
             self.setup()
+            self.run_case("revoke_battery_exemption", self.revoke_battery_exemption)
             self.run_case("slow_preflight_isolation", self.starvation)
+            self.run_case("upstream_transient_recovery", self.upstream_transient_recovery)
             self.run_case("screen_on_background", lambda: self.traffic(self.args.duration))
             self.shell("input keyevent 223")
             self.run_case("screen_off_long_stream", lambda: self.request(slow=True))
@@ -348,6 +497,8 @@ class Matrix:
             self.run_case("doze_exit_recovery", lambda: self.traffic(20))
             self.run_case("doze_with_exemption", lambda: self.doze(True))
             self.run_case("wifi_reconnection", self.wifi_reconnect)
+            self.run_case("cellular_handover", self.cellular_handover)
+            self.run_case("active_handover", self.active_handover)
             self.run_case("restricted_network_recovery", self.restricted_network)
             self.run_case("process_suspension_recovery", self.suspend)
             self.run_case("process_death_recovery", self.restart)
@@ -357,6 +508,7 @@ class Matrix:
             RELEASE.set()
             try:
                 self.restore_network_restriction()
+                self.restore_mobile_data(self.original_mobile_data)
             except subprocess.SubprocessError as error:
                 print(f"Network setting cleanup failed: {error}", flush=True)
             for command in ("dumpsys deviceidle unforce", "cmd power set-mode 0", "dumpsys battery reset",
@@ -371,6 +523,9 @@ class Matrix:
                 except subprocess.SubprocessError as error:
                     print(f"Forward cleanup failed: {error}", flush=True)
             self.server.shutdown()
+        missing = set(self.args.only or ()) - {result["name"] for result in self.results}
+        if missing:
+            raise SystemExit("Unknown background scenarios: " + ", ".join(sorted(missing)))
         if any(not result["passed"] for result in self.results):
             raise SystemExit(1)
 
@@ -381,5 +536,6 @@ if __name__ == "__main__":
     parser.add_argument("--serial", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--duration", type=int, default=120)
+    parser.add_argument("--start-cellular", action="store_true", help="Disable Wi-Fi before starting Rill")
     parser.add_argument("--only", nargs="+", help="Run only the named scenarios")
     Matrix(parser.parse_args()).run()

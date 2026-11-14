@@ -26,12 +26,6 @@ public final class Targets {
     public String toString() {
       return "http://" + host + (port == 80 ? "" : ":" + port);
     }
-
-    public String rule(String group) {
-      return host.matches("[0-9.]+")
-          ? "IP-CIDR," + host + "/32," + group + ",no-resolve"
-          : "DOMAIN," + host + "," + group;
-    }
   }
 
   public final List<Origin> origins;
@@ -102,14 +96,6 @@ public final class Targets {
     for (Origin o : origins)
       if (o.host.equalsIgnoreCase(url.getHost()) && o.port == port) return true;
     return false;
-  }
-
-  public boolean tunnel(String authority) {
-    try {
-      return allows(new URL("http://" + authority + "/"));
-    } catch (Exception e) {
-      return false;
-    }
   }
 
   public String text() {

@@ -137,16 +137,6 @@ final class Design {
           }
           c.drawPath(p, paint);
           break;
-        case "config":
-          p.moveTo(4, 5);
-          p.lineTo(9, 5);
-          p.lineTo(11, 8);
-          p.lineTo(20, 8);
-          p.lineTo(20, 19);
-          p.lineTo(4, 19);
-          p.close();
-          c.drawPath(p, paint);
-          break;
         case "log":
           c.drawRoundRect(5, 3, 19, 21, 3, 3, paint);
           c.drawLine(9, 8, 15, 8, paint);
@@ -162,31 +152,6 @@ final class Design {
             c.drawCircle(i == 1 ? 15 : 9, y, 2.6f, paint);
             paint.setStyle(Paint.Style.STROKE);
           }
-          break;
-        case "file":
-          p.moveTo(6, 3);
-          p.lineTo(14, 3);
-          p.lineTo(19, 8);
-          p.lineTo(19, 21);
-          p.lineTo(6, 21);
-          p.close();
-          c.drawPath(p, paint);
-          p.reset();
-          p.moveTo(14, 3);
-          p.lineTo(14, 8);
-          p.lineTo(19, 8);
-          c.drawPath(p, paint);
-          break;
-        case "link":
-          c.rotate(-40, 12, 12);
-          c.drawRoundRect(3, 8, 13, 16, 4, 4, paint);
-          c.drawRoundRect(11, 8, 21, 16, 4, 4, paint);
-          break;
-        case "check":
-          p.moveTo(5, 12);
-          p.lineTo(10, 17);
-          p.lineTo(20, 6);
-          c.drawPath(p, paint);
           break;
       }
       c.restore();

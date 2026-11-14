@@ -4,37 +4,31 @@
 
 # 澜流 · Rill
 
-**Android 本地 HTTP Range 中继**
+**BubbleUPnP 的 Android 音频 VPN**
 
-通过 Wi-Fi 并发获取音频分段，按原字节顺序交给播放器。
+通过 Wi-Fi 或蜂窝数据并发获取音频分段，按原字节顺序交给播放器。
 
 [![CI](https://github.com/ChrisDong-THU/Rill/actions/workflows/ci.yml/badge.svg)](https://github.com/ChrisDong-THU/Rill/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/ChrisDong-THU/Rill)](https://github.com/ChrisDong-THU/Rill/releases/latest)
-![Android 8.0+](https://img.shields.io/badge/Android-8.0%2B-245E49)
+![Android 10+](https://img.shields.io/badge/Android-10%2B-245E49)
 
 [下载正式版](https://github.com/ChrisDong-THU/Rill/releases/latest) · [使用指南](docs/usage.md) · [开发说明](docs/development.md) · [更新记录](CHANGELOG.md)
 
 </div>
 
-**已验证场景：使用 BubbleUPnP 软件取流 TIDAL 音源，配合本项目中继已验证有效。**
-
 ## 功能
 
-- **并发取流**：1–16 路上游连接，分段缓存、顺序输出与失败重试。
-- **Clash 配置适配**：读取文件或订阅，保留原节点与规则，添加本地节点和音频分流。
-- **后台会话**：前台通知、Wi-Fi 网络监听、断线与本地监听恢复。
-- **运行诊断**：连接、速度、预检、心跳及系统网络状态，可导出 JSON。
-
-仅支持标准 **HTTP Range** 上游；不解码、不转码，不支持 HTTPS 音频取流或额外认证请求头。中继监听 `127.0.0.1:18889`，只使用 Wi-Fi。
+- **独立音频 VPN**：通过 Android VPN 接管 BubbleUPnP 发往已配置音源 IP 的连接。
+- **并发取流**：匹配目标域名和端口的 HTTP 请求按 1–16 路分段下载，并按字节原序交付给播放器。
+- **后台会话**：使用前台 VPN 服务，随系统切换 Wi-Fi 或蜂窝数据，通过通知和诊断查看运行状态。
 
 ## 开始使用
 
-1. 安装 [Release APK](https://github.com/ChrisDong-THU/Rill/releases/latest)，连接 Wi-Fi。
-2. 在 Clash 中将「澜流」设为绕过代理，播放器继续由 Clash 接管。
-3. 在澜流导入完整 Clash YAML，适配后导入 Clash。
-4. Clash 使用规则模式，将「澜流 · 音频」组选为 `Rill Local`，然后在澜流点击「开启」。
+1. 安装澜流和 BubbleUPnP。已有其他 Android VPN 正在运行时，请先停止它。
+2. 在澜流「设置 → 加速链接」填写 HTTP 音源域名或地址。默认目标为 `lgf.audio.tidal.com`。
+3. 在澜流点击「开启」，首次使用时确认系统 VPN 授权，然后在 BubbleUPnP 开始播放。
 
-停止服务前，将音频组切回 `DIRECT`。详细操作和排障见 [使用指南](docs/usage.md)。
+澜流分段加速支持 HTTP Range 的音源。更多设置和排障见 [使用指南](docs/usage.md)。
 
 ## 构建
 
@@ -56,12 +50,12 @@ Debug APK：`app/build/outputs/apk/debug/app-debug.apk`。正式 APK 使用独�
 
 | 目录 | 内容 |
 | --- | --- |
-| `app/` | Android 界面、前台服务、Wi-Fi、配置存储与分享 |
-| `core/` | 纯 Java 中继、HTTP 协议、配置转换与 JVM 测试 |
+| `app/` | Android 界面、分流 VPN、上游网络与诊断 |
+| `core/` | 纯 Java 中继、HTTP 协议与 JVM 测试 |
 | `docs/` | 使用、架构、验证与发布指南 |
 | `tools/` | 模拟器取流验证、正式包校验与打包 |
 | `licenses/` | 打包进 APK 的第三方许可 |
 
-依赖方向为 `app → core → SnakeYAML`。运行与并发约定见 [开发说明](docs/development.md)，设备验证范围见 [后台测试](docs/background-testing.md)。
+Android 端使用 hev-socks5-tunnel，HTTP Range 中继位于 `core`。运行与并发约定见 [开发说明](docs/development.md)，设备验证范围见 [后台测试](docs/background-testing.md)。
 
 项目尚未指定开源许可证；第三方组件按 [各自许可](licenses/NOTICE.txt) 分发。

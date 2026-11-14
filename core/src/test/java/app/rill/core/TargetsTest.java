@@ -15,7 +15,7 @@ public class TargetsTest {
     assertTrue(targets.allows(new URL("http://example.com/another?token=new")));
     assertFalse(targets.allows(new URL("http://example.com:8080/another")));
     assertFalse(targets.allows(new URL("http://other.example/another")));
-    assertEquals("IP-CIDR,127.0.0.2/32,Group,no-resolve", targets.origins.get(1).rule("Group"));
+    assertEquals("127.0.0.2", targets.origins.get(1).host);
   }
 
   @Test
@@ -37,12 +37,9 @@ public class TargetsTest {
   }
 
   @Test
-  public void enforcesOriginCountAndTunnelAllowlist() throws Exception {
+  public void enforcesOriginCount() {
     StringBuilder input = new StringBuilder();
     for (int i = 0; i < 17; i++) input.append("host").append(i).append(".example\n");
     assertThrows(IOException.class, () -> Targets.parse(input.toString()));
-    Targets targets = Targets.parse("example.com:8080");
-    assertTrue(targets.tunnel("example.com:8080"));
-    assertFalse(targets.tunnel("example.com:443"));
   }
 }

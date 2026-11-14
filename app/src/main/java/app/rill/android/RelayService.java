@@ -4,13 +4,13 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
-import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.net.Network;
+import android.net.VpnService;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
-import android.os.IBinder;
 import android.os.SystemClock;
 import app.rill.core.LiveStats;
 import app.rill.core.RelayCore;
@@ -18,6 +18,7 @@ import app.rill.core.Targets;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
@@ -26,16 +27,18 @@ import java.util.Collections;
 import java.util.Date;
 import java.util.Iterator;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-public final class RelayService extends Service {
+public final class RelayService extends VpnService {
   private static final int NOTIFICATION_ID = 41;
   private static final String NOTIFICATION_CHANNEL = "relay";
   private static final long ACTIVE_SAMPLE_MS = 10000, IDLE_SAMPLE_MS = 60000;
+  private static final long ROUTE_REFRESH_MS = 60_000, ROUTE_RETRY_MS = 10_000;
   private static final int MAX_EVENTS = 200, MAX_SAMPLES = 900;
   private static final int SNAPSHOT_EVENTS = 60, SNAPSHOT_SAMPLES = 24;
   private static final Object DIAGNOSTIC_FILE_LOCK = new Object();
@@ -46,13 +49,21 @@ public final class RelayService extends Service {
   public volatile RelayCore core;
   private final ArrayDeque<String> history = new ArrayDeque<>();
   private final ArrayDeque<JSONObject> samples = new ArrayDeque<>();
-  private final SimpleDateFormat eventTime = new SimpleDateFormat("HH:mm:ss", Locale.ROOT);
+  private final SimpleDateFormat eventTime = new SimpleDateFormat("HH:mm:ss.SSS", Locale.ROOT);
   private String cachedLogText;
   private volatile int eventCount;
   private HandlerThread worker;
   private Handler handler;
   private BackgroundGuard guard;
-  private WifiUpstream wifiUpstream;
+  private NetworkUpstream networkUpstream;
+  private volatile AudioVpn vpn;
+  private final ExecutorService resolver = Executors.newSingleThreadExecutor();
+  private boolean resolvingRoutes;
+  private Network routeNetwork;
+  private Set<InetAddress> routeAddresses;
+  private String routeTargets;
+  private long nextRouteRefresh;
+  private String lastRouteError = "";
   private final ExecutorService diagnostics = Executors.newSingleThreadExecutor();
   private final AtomicBoolean savePending = new AtomicBoolean();
   private long nextStartAttempt;
@@ -69,6 +80,7 @@ public final class RelayService extends Service {
   private JSONObject sampledPower;
   private String lastGuardError = "";
   private String lastNetworkError = "";
+  private boolean networkChanged;
   private final LiveStats live = new LiveStats();
   private String notifiedConnections = "", notifiedDownload = "";
   private final Object notificationLock = new Object();
@@ -93,13 +105,35 @@ public final class RelayService extends Service {
     worker.start();
     handler = new Handler(worker.getLooper());
     guard = new BackgroundGuard(this);
-    wifiUpstream = new WifiUpstream(this, this::log);
+    networkUpstream = new NetworkUpstream(this, this::onNetworkStateChanged);
     sessionId = ++latestSessionId;
     instance = this;
   }
 
   public boolean isSessionActive() {
     return sessionActive && !stopping;
+  }
+
+  boolean isVpnReady() {
+    AudioVpn activeVpn = vpn;
+    return activeVpn != null && activeVpn.isRunning();
+  }
+
+  String connectionStatus() {
+    return message;
+  }
+
+  void targetsChanged() {
+    handler.post(() -> nextRouteRefresh = 0);
+  }
+
+  private void onNetworkStateChanged(String state) {
+    handler.post(
+        () -> {
+          if (stopping) return;
+          log(state);
+          networkChanged = true;
+        });
   }
 
   private CharSequence notificationMetrics() {
@@ -126,7 +160,6 @@ public final class RelayService extends Service {
     PendingIntent content =
         PendingIntent.getActivity(
             this, 0, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-    // Like Clash: one standard title/body notification, no custom or expanded template.
     Notification.Builder builder =
         new Notification.Builder(this, NOTIFICATION_CHANNEL)
             .setSmallIcon(R.drawable.ic_rill_status)
@@ -156,11 +189,16 @@ public final class RelayService extends Service {
   @Override
   public int onStartCommand(Intent intent, int flags, int startId) {
     if (intent != null && STOP.equals(intent.getAction())) {
-      getSharedPreferences("rill", 0).edit().putBoolean("relay_enabled", false).commit();
+      stopSession();
+      return START_NOT_STICKY;
+    }
+    if (stopping) return START_NOT_STICKY;
+    if (intent == null && !getSharedPreferences("rill", 0).getBoolean("relay_enabled", false)) {
       stopSelf();
       return START_NOT_STICKY;
     }
-    if (intent == null && !getSharedPreferences("rill", 0).getBoolean("relay_enabled", false)) {
+    if (prepare(this) != null) {
+      getSharedPreferences("rill", 0).edit().putBoolean("relay_enabled", false).apply();
       stopSelf();
       return START_NOT_STICKY;
     }
@@ -189,13 +227,14 @@ public final class RelayService extends Service {
     RelayCore old = core;
     core = null;
     if (old != null) {
+      closeVpn();
       old.close();
       recoveries++;
       log("本地监听已中断，正在恢复");
     }
     RelayCore c =
         new RelayCore(
-            wifiUpstream::open,
+            networkUpstream::open,
             new RelayCore.Events() {
               @Override
               public void event(String message) {
@@ -224,17 +263,119 @@ public final class RelayService extends Service {
         c.close();
         return;
       }
-      c.start(RelayCore.PORT);
+      if (BuildConfig.DEBUG) c.start(RelayCore.PORT);
+      else {
+        c.start();
+        log("音频中继已启动");
+      }
       core = c;
-      message = "已启动，等待取流";
+      message = "正在建立 VPN";
     } catch (IOException | RuntimeException e) {
       c.close();
       throw e;
     }
   }
 
+  private void ensureVpn(RelayCore relay, long now) {
+    Network network = networkUpstream.current();
+    if (network == null) {
+      message = networkUpstream.status();
+      return;
+    }
+    if (resolvingRoutes) return;
+    String configured = getSharedPreferences("rill", 0).getString("targets", Targets.DEFAULT);
+    if (now < nextRouteRefresh && network.equals(routeNetwork) && configured.equals(routeTargets))
+      return;
+    routeNetwork = network;
+    routeTargets = configured;
+    resolvingRoutes = true;
+    nextRouteRefresh = now + ROUTE_REFRESH_MS;
+    resolver.execute(
+        () -> {
+          try {
+            Targets targets = Targets.parse(configured);
+            Set<InetAddress> addresses = AudioVpn.resolve(network, targets);
+            handler.post(() -> applyRoutes(relay, network, configured, targets, addresses));
+          } catch (IOException | RuntimeException error) {
+            handler.post(
+                () -> {
+                  if (acceptRouteResult(relay, network, configured)) routeFailed(error);
+                });
+          }
+        });
+  }
+
+  private boolean acceptRouteResult(RelayCore relay, Network network, String configured) {
+    resolvingRoutes = false;
+    if (stopping || relay != core) return false;
+    if (!network.equals(networkUpstream.current())
+        || !configured.equals(
+            getSharedPreferences("rill", 0).getString("targets", Targets.DEFAULT))) {
+      nextRouteRefresh = 0;
+      return false;
+    }
+    return true;
+  }
+
+  private void applyRoutes(
+      RelayCore relay,
+      Network network,
+      String configured,
+      Targets targets,
+      Set<InetAddress> addresses) {
+    if (!acceptRouteResult(relay, network, configured)) return;
+    try {
+      relay.setTargets(targets);
+      boolean rebuilt = !isVpnReady() || !addresses.equals(routeAddresses);
+      if (rebuilt) {
+        closeVpn();
+        vpn = new AudioVpn(this, networkUpstream, relay, network, addresses);
+        routeAddresses = addresses;
+        nextRouteRefresh = SystemClock.elapsedRealtime() + ROUTE_REFRESH_MS;
+        log("音频 VPN 已就绪 · " + addresses.size() + " 条地址路由");
+      } else {
+        setUnderlyingNetworks(new Network[] {network});
+      }
+      networkChanged |= rebuilt || !"VPN 已连接".equals(message) || !lastRouteError.isEmpty();
+      message = "VPN 已连接";
+      lastRouteError = "";
+    } catch (IOException | RuntimeException | LinkageError error) {
+      routeFailed(error);
+    }
+  }
+
+  private void routeFailed(Throwable error) {
+    String detail =
+        error instanceof IOException
+            ? RelayCore.safe((IOException) error)
+            : error.getClass().getSimpleName();
+    String failure = "VPN 路由更新失败：" + detail;
+    if (!failure.equals(lastRouteError)) {
+      log(failure);
+      networkChanged = true;
+    }
+    lastRouteError = failure;
+    if (!isVpnReady()) message = failure;
+    nextRouteRefresh = SystemClock.elapsedRealtime() + ROUTE_RETRY_MS;
+  }
+
+  private void closeVpn() {
+    AudioVpn current = vpn;
+    vpn = null;
+    routeAddresses = null;
+    nextRouteRefresh = 0;
+    if (current != null) {
+      try {
+        current.close();
+      } catch (IOException error) {
+        log("关闭 VPN：" + RelayCore.safe(error));
+      }
+    }
+  }
+
   private void ensureCore(long now) {
-    if ((core != null && core.isListening()) || now < nextStartAttempt) return;
+    if ((core != null && (BuildConfig.DEBUG ? core.isListening() : core.running))
+        || now < nextStartAttempt) return;
     try {
       startCore();
       startFailures = 0;
@@ -268,16 +409,17 @@ public final class RelayService extends Service {
               lastGuardError = error;
             }
             try {
-              wifiUpstream.start();
+              networkUpstream.start();
               lastNetworkError = "";
             } catch (Exception e) {
-              String error = "Wi-Fi 监听异常：" + RelayCore.safe(e);
+              String error = "网络监听异常：" + RelayCore.safe(e);
               if (!error.equals(lastNetworkError)) log(error);
               lastNetworkError = error;
             }
             ensureCore(now);
             RelayCore c = core;
             if (c == null || stopping) return;
+            ensureVpn(c, now);
             long downloaded = c.downloaded.get();
             int connections = c.connections.get();
             synchronized (notificationLock) {
@@ -302,7 +444,9 @@ public final class RelayService extends Service {
                     || events != sampledEvents;
             if (sampledCore != c
                 || resumedAfterGap
+                || networkChanged && !savePending.get()
                 || now - lastSample >= (hasTraffic ? ACTIVE_SAMPLE_MS : IDLE_SAMPLE_MS)) {
+              if (!savePending.get()) networkChanged = false;
               lastSample = now;
               sampledCore = c;
               sampledRequests = requests;
@@ -380,10 +524,11 @@ public final class RelayService extends Service {
       j.put("service_max_tick_gap_ms", maxTickGap);
       j.put("listener_recoveries", recoveries);
       j.put("listener_start_failures", startFailures);
-      j.put("wifi", wifiUpstream.report());
+      j.put("network", networkUpstream.report());
+      j.put("vpn_running", isVpnReady());
       j.put("state", message);
-      j.put("upstream_transport", "Wi-Fi Network.openConnection + Proxy.NO_PROXY");
-      j.put("proxy_listener", "127.0.0.1:18889");
+      j.put("upstream_transport", "Wi-Fi/cellular Network.openConnection + Proxy.NO_PROXY");
+      if (BuildConfig.DEBUG) j.put("test_listener", "127.0.0.1:18889");
       j.put("targets", getSharedPreferences("rill", 0).getString("targets", Targets.DEFAULT));
       RelayCore c = core;
       j.put(
@@ -409,7 +554,7 @@ public final class RelayService extends Service {
         j.put("errors", c.errors.get());
         j.put("last_error", c.lastError);
         j.put("running", c.running);
-        j.put("listener_alive", c.isListening());
+        if (BuildConfig.DEBUG) j.put("listener_alive", c.isListening());
       }
       synchronized (history) {
         j.put("events", latest(history, eventLimit));
@@ -462,8 +607,25 @@ public final class RelayService extends Service {
 
   public void onTimeout(int startId, int fgsType) {
     log("系统要求停止后台服务");
+    stopSession();
+  }
+
+  private void stopSession() {
+    synchronized (notificationLock) {
+      if (stopping) return;
+      stopping = true;
+      sessionActive = false;
+    }
     getSharedPreferences("rill", 0).edit().putBoolean("relay_enabled", false).apply();
-    stopSelf();
+    handler.postAtFrontOfQueue(
+        () -> {
+          // Android keeps this service bound until the VPN's TUN descriptor closes.
+          try {
+            closeVpn();
+          } finally {
+            stopSelf();
+          }
+        });
   }
 
   @Override
@@ -474,13 +636,15 @@ public final class RelayService extends Service {
       stopForeground(true);
     }
     handler.removeCallbacksAndMessages(null);
+    resolver.shutdownNow();
     guard.close();
-    wifiUpstream.close();
+    networkUpstream.close();
     message = "服务已停止";
     if (instance == this) instance = null;
     handler.post(
         () -> {
           try {
+            closeVpn();
             if (core != null) core.close();
             diagnostics.execute(() -> save(MAX_EVENTS, MAX_SAMPLES));
           } finally {
@@ -492,7 +656,7 @@ public final class RelayService extends Service {
   }
 
   @Override
-  public IBinder onBind(Intent intent) {
-    return null;
+  public void onRevoke() {
+    stopSession();
   }
 }

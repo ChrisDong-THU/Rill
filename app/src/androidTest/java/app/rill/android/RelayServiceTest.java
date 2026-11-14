@@ -34,10 +34,11 @@ import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
-/** Run on an isolated emulator: these tests toggle Wi-Fi and start/stop the app's service. */
+/** Run on an isolated emulator: these tests change network settings and start/stop the service. */
 @RunWith(AndroidJUnit4.class)
 public class RelayServiceTest {
   private Context context;
+  private String originalMobileData;
 
   @Before
   public void setUp() throws Exception {
@@ -46,15 +47,13 @@ public class RelayServiceTest {
         Build.VERSION.SDK_INT >= 33
             && (Build.HARDWARE.equals("ranchu") || Build.HARDWARE.equals("goldfish")));
     context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-    context.stopService(new Intent(context, RelayService.class));
+    originalMobileData = shell("settings get global mobile_data").trim();
+    if (RelayService.instance != null)
+      context.startService(new Intent(context, RelayService.class).setAction(RelayService.STOP));
     await(() -> RelayService.instance == null, 5000);
-    context
-        .getSharedPreferences("rill", 0)
-        .edit()
-        .putBoolean("notifications_asked", true)
-        .putBoolean("background_asked", true)
-        .commit();
+    context.getSharedPreferences("rill", 0).edit().putBoolean("notifications_asked", true).commit();
     shell("pm grant " + context.getPackageName() + " android.permission.POST_NOTIFICATIONS");
+    shell("cmd appops set " + context.getPackageName() + " ACTIVATE_VPN allow");
     shell("svc wifi enable");
     shell("cmd wifi connect-network AndroidWifi open");
   }
@@ -75,6 +74,8 @@ public class RelayServiceTest {
   public void tearDown() throws Exception {
     if (context == null) return;
     shell("svc wifi enable");
+    if ("0".equals(originalMobileData)) shell("svc data disable");
+    if ("1".equals(originalMobileData)) shell("svc data enable");
     if (RelayService.instance != null) {
       context.startService(new Intent(context, RelayService.class).setAction(RelayService.STOP));
       await(() -> RelayService.instance == null, 5000);
@@ -100,7 +101,7 @@ public class RelayServiceTest {
     SystemClock.sleep(2500);
     JSONObject report = new JSONObject(service.report());
     assertFalse(report.getJSONObject("background").getBoolean("cpu_lock_held"));
-    assertTrue(report.getJSONObject("wifi").getBoolean("request_active"));
+    assertTrue(report.getJSONObject("network").getBoolean("request_active"));
     assertTrue(report.getLong("service_tick_age_ms") < 2500);
     assertEquals(first.when, notification().when);
     assertTrue(health().startsWith("HTTP/1.1 200"));
@@ -110,8 +111,7 @@ public class RelayServiceTest {
     await(() -> service.core == null || !service.core.isListening(), 5000);
     assertFalse(
         new JSONObject(service.report()).getJSONObject("background").getBoolean("cpu_lock_held"));
-    assertFalse(
-        new JSONObject(service.report()).getJSONObject("wifi").getBoolean("request_active"));
+    assertFalse(network(service).getBoolean("request_active"));
     assertNull(notification());
   }
 
@@ -119,9 +119,7 @@ public class RelayServiceTest {
   public void relayRequestAcquiresWakeLockBeforePreflightAndKeepsIdleGrace() throws Exception {
     RelayService service = startInBackground();
     await(() -> service.core != null && service.core.isListening(), 5000);
-    await(
-        () -> new JSONObject(service.report()).getJSONObject("wifi").getBoolean("available"),
-        20000);
+    await(() -> network(service).getBoolean("available"), 20000);
     try (ServerSocket origin = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"));
         Socket player = new Socket("127.0.0.1", RelayCore.PORT)) {
       origin.setSoTimeout(6000);
@@ -152,6 +150,15 @@ public class RelayServiceTest {
 
   private static JSONObject background(RelayService service) throws Exception {
     return new JSONObject(service.report()).getJSONObject("background");
+  }
+
+  private static JSONObject network(RelayService service) throws Exception {
+    return new JSONObject(service.report()).getJSONObject("network");
+  }
+
+  private static boolean uses(RelayService service, String transport) throws Exception {
+    JSONObject network = network(service);
+    return network.getBoolean("available") && transport.equals(network.getString("transport"));
   }
 
   @Test
@@ -250,25 +257,37 @@ public class RelayServiceTest {
 
   @Test
   public void wifiReconnectIsObservedWhileActivityIsClosed() throws Exception {
+    shell("svc data disable");
     RelayService service = startInBackground();
-    await(
-        () -> new JSONObject(service.report()).getJSONObject("wifi").getBoolean("available"),
-        20000);
+    await(() -> uses(service, "wifi"), 20000);
     long when = notification().when;
     shell("svc wifi disable");
-    await(
-        () -> !new JSONObject(service.report()).getJSONObject("wifi").getBoolean("available"),
-        10000);
+    await(() -> !network(service).getBoolean("available"), 10000);
     assertTrue(service.isSessionActive());
     assertTrue(health().startsWith("HTTP/1.1 200"));
     shell("svc wifi enable");
     // The emulator's unvalidated test AP may not autojoin after toggling Wi-Fi.
     shell("cmd wifi connect-network AndroidWifi open");
-    await(
-        () -> new JSONObject(service.report()).getJSONObject("wifi").getBoolean("available"),
-        20000);
+    await(() -> uses(service, "wifi"), 20000);
     assertTrue(health().startsWith("HTTP/1.1 200"));
     assertEquals(when, notification().when);
+  }
+
+  @Test
+  public void startsOnCellularAndSwitchesToWifiWithoutRestartingTheRelay() throws Exception {
+    shell("svc data enable");
+    shell("svc wifi disable");
+    RelayService service = startInBackground();
+    await(() -> uses(service, "cellular"), 20000);
+    RelayCore original = service.core;
+    assertTrue(network(service).getBoolean("metered"));
+    assertTrue(health().startsWith("HTTP/1.1 200"));
+    shell("svc wifi enable");
+    shell("cmd wifi connect-network AndroidWifi open");
+    shell("svc data disable");
+    await(() -> uses(service, "wifi"), 20000);
+    assertSame(original, service.core);
+    assertTrue(health().startsWith("HTTP/1.1 200"));
   }
 
   private Notification notification() {
@@ -292,13 +311,13 @@ public class RelayServiceTest {
     }
   }
 
-  private static void shell(String command) throws Exception {
+  private static String shell(String command) throws Exception {
     try (ParcelFileDescriptor result =
             InstrumentationRegistry.getInstrumentation()
                 .getUiAutomation()
                 .executeShellCommand(command);
         InputStream input = new ParcelFileDescriptor.AutoCloseInputStream(result)) {
-      read(input);
+      return read(input);
     }
   }
 
