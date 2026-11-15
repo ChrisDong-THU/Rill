@@ -88,7 +88,7 @@ public class RelayServiceTest {
     await(() -> service.core != null && service.core.isListening(), 5000);
     Notification first = notification();
     assertNotNull(first);
-    service.core.setConnectionLimit(5);
+    service.setConnectionLimit(5);
     await(
         () ->
             notification() != null
@@ -102,7 +102,7 @@ public class RelayServiceTest {
     JSONObject report = new JSONObject(service.report());
     assertFalse(report.getJSONObject("background").getBoolean("cpu_lock_held"));
     assertTrue(report.getJSONObject("network").getBoolean("request_active"));
-    assertTrue(report.getLong("service_tick_age_ms") < 2500);
+    assertTrue(report.getLong("service_tick_age_ms") < 6500);
     assertEquals(first.when, notification().when);
     assertTrue(health().startsWith("HTTP/1.1 200"));
     assertFalse(background(service).getBoolean("cpu_lock_held"));

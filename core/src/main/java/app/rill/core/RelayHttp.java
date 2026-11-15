@@ -20,12 +20,12 @@ final class RelayHttp {
 
   private RelayHttp() {}
 
-  static class Request {
+  static final class Request {
     String method, target;
-    Map<String, String> headers = new HashMap<String, String>();
+    final Map<String, String> headers = new HashMap<>();
   }
 
-  static String line(InputStream in) throws IOException {
+  private static String line(InputStream in) throws IOException {
     ByteArrayOutputStream b = new ByteArrayOutputStream();
     int c;
     while ((c = in.read()) != -1) {
@@ -98,15 +98,15 @@ final class RelayHttp {
     }
   }
 
-  static class RangeException extends IOException {
-    long size;
+  static final class RangeException extends IOException {
+    final long size;
 
     RangeException(long s) {
       size = s;
     }
   }
 
-  public static long[] range(String value, long size) throws IOException {
+  static long[] range(String value, long size) throws RangeException {
     if (value == null) return new long[] {0, size - 1};
     Matcher m = BYTE_RANGE.matcher(value);
     if (!m.matches()) throw new RangeException(size);

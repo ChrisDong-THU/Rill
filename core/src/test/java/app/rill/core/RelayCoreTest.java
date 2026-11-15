@@ -1,5 +1,6 @@
 package app.rill.core;
 
+import static app.rill.core.RelayHttp.range;
 import static org.junit.Assert.*;
 
 import com.sun.net.httpserver.HttpServer;
@@ -510,15 +511,15 @@ public class RelayCoreTest {
 
   @Test
   public void parsesRangesAndRejectsInvalidRanges() throws Exception {
-    assertArrayEquals(new long[] {0, 99}, RelayCore.range(null, 100));
-    assertArrayEquals(new long[] {10, 99}, RelayCore.range("bytes=10-", 100));
-    assertArrayEquals(new long[] {90, 99}, RelayCore.range("bytes=-10", 100));
-    assertArrayEquals(new long[] {0, 99}, RelayCore.range("bytes=0-999", 100));
+    assertArrayEquals(new long[] {0, 99}, range(null, 100));
+    assertArrayEquals(new long[] {10, 99}, range("bytes=10-", 100));
+    assertArrayEquals(new long[] {90, 99}, range("bytes=-10", 100));
+    assertArrayEquals(new long[] {0, 99}, range("bytes=0-999", 100));
     for (String value :
         new String[] {
           "bytes=100-", "bytes=9-2", "bytes=-0", "bytes=0-1,3-4", "bytes=999999999999999999999-"
         }) {
-      assertThrows(IOException.class, () -> RelayCore.range(value, 100));
+      assertThrows(IOException.class, () -> range(value, 100));
     }
   }
 
@@ -656,7 +657,7 @@ public class RelayCoreTest {
   @Test
   public void boundsReadAheadBeforeSendingResponseBytes() throws Exception {
     int block = RelayCore.BLOCK, end = 8 * block + 20;
-    CountDownLatch startup = new CountDownLatch(3);
+    CountDownLatch startup = new CountDownLatch(1);
     CountDownLatch speculative = new CountDownLatch(1);
     CountDownLatch release = new CountDownLatch(1);
     ExecutorService client = Executors.newSingleThreadExecutor();
@@ -668,14 +669,17 @@ public class RelayCoreTest {
                     end + 1,
                     range -> {
                       if (range[1] > 65535) {
-                        if (range[0] < 3L * block) startup.countDown();
-                        else speculative.countDown();
+                        if (range[0] == 65536) {
+                          assertEquals(2L * block - 1, range[1]);
+                          startup.countDown();
+                        } else speculative.countDown();
                         awaitPreflight(release);
                       }
                       return new ByteArrayInputStream(
                           trackBytes((int) range[0], (int) (range[1] - range[0] + 1)));
                     }),
-            message -> {})) {
+            message -> {},
+            1)) {
       relay.setTargets(Targets.parse("example.com"));
       relay.start(0);
       Future<Response> response = client.submit(() -> trackRange(relay.getListeningPort(), 1, end));
@@ -691,6 +695,84 @@ public class RelayCoreTest {
     } finally {
       release.countDown();
       client.shutdownNow();
+    }
+  }
+
+  @Test
+  public void mergesSequentialRangesAndResumesAcrossCacheBlocks() throws Exception {
+    int size = 12 * RelayCore.BLOCK + 20;
+    List<long[]> ranges = Collections.synchronizedList(new ArrayList<>());
+    AtomicInteger interrupted = new AtomicInteger();
+    try (RelayCore relay =
+        new RelayCore(
+            url ->
+                rangedTrack(
+                    url,
+                    size,
+                    range -> {
+                      ranges.add(range);
+                      int length = (int) (range[1] - range[0] + 1);
+                      if (range[0] == 65536 && interrupted.getAndIncrement() == 0)
+                        length = RelayCore.BLOCK;
+                      return new ByteArrayInputStream(trackBytes((int) range[0], length));
+                    }),
+            message -> {},
+            1)) {
+      relay.setTargets(Targets.parse("example.com"));
+      relay.start(0);
+      assertArrayEquals(
+          trackBytes(0, size), trackRange(relay.getListeningPort(), 0, size - 1).body);
+      assertEquals(1, relay.retries.get());
+      assertArrayEquals(new long[] {65536, 2L * RelayCore.BLOCK - 1}, ranges.get(1));
+      assertEquals(65536L + RelayCore.BLOCK, ranges.get(2)[0]);
+      assertTrue("Contiguous blocks should share a source request", ranges.size() < 10);
+      assertEquals(size, relay.downloaded.get());
+    }
+  }
+
+  @Test
+  public void aSingleStalledReaderCanUseSixteenConnectionsAfterChangingTheLimit() throws Exception {
+    int size = 40 * RelayCore.BLOCK;
+    CountDownLatch firstRange = new CountDownLatch(1);
+    CountDownLatch simultaneous = new CountDownLatch(16), release = new CountDownLatch(1);
+    ExecutorService player = Executors.newSingleThreadExecutor();
+    try (RelayCore relay =
+        new RelayCore(
+            url ->
+                rangedTrack(
+                    url,
+                    size,
+                    range -> {
+                      if (range[0] != 0 && release.getCount() != 0) {
+                        firstRange.countDown();
+                        simultaneous.countDown();
+                        awaitPreflight(release);
+                      }
+                      return new ByteArrayInputStream(
+                          trackBytes((int) range[0], (int) (range[1] - range[0] + 1)));
+                    }),
+            message -> {},
+            1)) {
+      relay.setTargets(Targets.parse("example.com"));
+      relay.start(0);
+      Future<Response> output =
+          player.submit(() -> trackRange(relay.getListeningPort(), 0, size - 1));
+      try {
+        assertTrue("Playback never requested a range", firstRange.await(2, TimeUnit.SECONDS));
+        assertEquals(1, relay.connections.get());
+        relay.setConnectionLimit(16);
+        assertTrue(
+            "The selected connection ceiling was never reached",
+            simultaneous.await(4, TimeUnit.SECONDS));
+        assertEquals(16, relay.connections.get());
+        assertTrue(relay.getCachedBytes() <= 48L * RelayCore.BLOCK);
+      } finally {
+        release.countDown();
+      }
+      assertArrayEquals(trackBytes(0, size), output.get(10, TimeUnit.SECONDS).body);
+    } finally {
+      release.countDown();
+      player.shutdownNow();
     }
   }
 
@@ -789,7 +871,7 @@ public class RelayCoreTest {
 
       @Override
       public int getResponseCode() throws IOException {
-        range = RelayCore.range(getRequestProperty("Range"), size);
+        range = range(getRequestProperty("Range"), size);
         return 206;
       }
 
@@ -828,8 +910,7 @@ public class RelayCoreTest {
         "/audio",
         exchange -> {
           try {
-            long[] range =
-                RelayCore.range(exchange.getRequestHeaders().getFirst("Range"), content.length);
+            long[] range = range(exchange.getRequestHeaders().getFirst("Range"), content.length);
             int first = (int) range[0], last = (int) range[1];
             exchange
                 .getResponseHeaders()

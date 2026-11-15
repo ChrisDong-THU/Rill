@@ -72,7 +72,7 @@ public final class MainActivity extends Activity {
   @Override
   public void onCreate(Bundle saved) {
     super.onCreate(saved);
-    prefs = getSharedPreferences("rill", 0);
+    prefs = getSharedPreferences("rill", MODE_PRIVATE);
     d = new Design(this);
     if (saved != null) {
       page = saved.getInt("page", 0) == RECORDS ? RECORDS : 0;
@@ -353,7 +353,7 @@ public final class MainActivity extends Activity {
   }
 
   private int limit() {
-    return prefs.getInt("connections", 8);
+    return prefs.getInt("connections", RelayCore.DEFAULT_CONNECTION_LIMIT);
   }
 
   private void toggle() {
@@ -440,7 +440,7 @@ public final class MainActivity extends Activity {
     content.addView(d.text("默认 8 · 可选择 1–16", 13, d.muted));
     gap(content, 20);
     SeekBar slider = new SeekBar(this);
-    slider.setMax(15);
+    slider.setMax(RelayCore.MAX_CONNECTION_LIMIT - 1);
     slider.setProgress(choice[0] - 1);
     slider.setProgressTintList(android.content.res.ColorStateList.valueOf(d.accent));
     slider.setThumbTintList(android.content.res.ColorStateList.valueOf(d.accent));
@@ -459,7 +459,7 @@ public final class MainActivity extends Activity {
         });
     LinearLayout presets = new LinearLayout(this);
     content.addView(presets, new LinearLayout.LayoutParams(-1, d.dp(44)));
-    for (int n : new int[] {4, 8, 12, 16}) {
+    for (int n : new int[] {1, 2, 4, 8, 16}) {
       TextView chip = d.text(String.valueOf(n), 14, d.accent);
       chip.setGravity(Gravity.CENTER);
       chip.setBackground(d.rounded(d.soft, 16));
@@ -470,7 +470,7 @@ public final class MainActivity extends Activity {
       d.press(chip);
     }
     gap(content, 18);
-    content.addView(d.text("调低上限时，已建立的连接会先完成。", 12, d.muted));
+    content.addView(d.text("取流从一路起步。持续等不到数据时可逐步增至所选上限。", 12, d.muted));
     gap(content, 22);
     TextView apply = d.button("应用", true);
     addButton(content, apply);
@@ -479,10 +479,7 @@ public final class MainActivity extends Activity {
         v -> {
           prefs.edit().putInt("connections", choice[0]).apply();
           RelayService s = RelayService.instance;
-          if (s != null && s.core != null) {
-            s.core.setConnectionLimit(choice[0]);
-            s.log("连接上限调整为 " + choice[0]);
-          }
+          if (s != null) s.setConnectionLimit(choice[0]);
           dialog.dismiss();
           update();
           toast("已设为 " + choice[0] + " 路");

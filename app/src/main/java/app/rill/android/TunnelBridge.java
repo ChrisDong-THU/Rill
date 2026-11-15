@@ -91,8 +91,7 @@ final class TunnelBridge implements Closeable {
 
       // The tunnel may hand us opaque TCP on an IP shared by several origins. Inspect only
       // configured HTTP ports and leave other protocols byte-for-byte intact.
-      boolean inspect =
-          relay.getTargets().origins.stream().anyMatch(o -> o.port == destination.getPort());
+      boolean inspect = relay.handlesHttpPort(destination.getPort());
       if (inspect) {
         reply(output, 0);
         input.mark(HEADER_LIMIT);
@@ -145,8 +144,9 @@ final class TunnelBridge implements Closeable {
   }
 
   private void connectDirect(Socket socket, InetSocketAddress destination) throws IOException {
-    if (!service.protect(socket)) throw new IOException("无法保护直连套接字");
+    // Binding materializes the descriptor before protect() uses it.
     upstream.awaitNetwork().bindSocket(socket);
+    if (!service.protect(socket)) throw new IOException("无法保护直连套接字");
     socket.connect(destination, 8000);
   }
 

@@ -5,9 +5,9 @@ import java.util.Locale;
 /** Monotonic transfer counters shared by the app and notification. */
 public final class LiveStats {
   private long previousTime = -1, previousDownload;
-  private int previousConnections, previousLimit = 8;
+  private int previousConnections, previousLimit = RelayCore.DEFAULT_CONNECTION_LIMIT;
   public double downloadRate;
-  public String connectionsText = "0/8", downloadText = "0 B/s";
+  public String connectionsText = "0/" + RelayCore.DEFAULT_CONNECTION_LIMIT, downloadText = "0 B/s";
 
   public void sample(long now, long download, int connections, int limit) {
     double nextRate =

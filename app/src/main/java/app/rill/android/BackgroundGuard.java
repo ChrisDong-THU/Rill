@@ -4,6 +4,7 @@ import android.annotation.SuppressLint;
 import android.app.ActivityManager;
 import android.content.Context;
 import android.os.Build;
+import android.os.Handler;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import org.json.JSONObject;
@@ -14,12 +15,15 @@ public final class BackgroundGuard {
   private final Context context;
   private final PowerManager power;
   private final PowerManager.WakeLock cpu;
+  private final Handler handler;
+  private final Runnable idleRelease = this::maintain;
   private int requests;
   private long idleUntil;
   private boolean closed;
 
-  public BackgroundGuard(Context context) {
+  public BackgroundGuard(Context context, Handler handler) {
     this.context = context.getApplicationContext();
+    this.handler = handler;
     power = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
     cpu = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Rill:RelaySession");
     cpu.setReferenceCounted(false);
@@ -27,13 +31,17 @@ public final class BackgroundGuard {
 
   public synchronized void requestStarted() {
     if (closed) return;
+    handler.removeCallbacks(idleRelease);
     requests++;
     maintain();
   }
 
   public synchronized void requestFinished() {
     if (closed) return;
-    if (--requests == 0) idleUntil = SystemClock.elapsedRealtime() + IDLE_GRACE_MS;
+    if (--requests == 0) {
+      idleUntil = SystemClock.elapsedRealtime() + IDLE_GRACE_MS;
+      handler.postDelayed(idleRelease, IDLE_GRACE_MS);
+    }
   }
 
   @SuppressLint("WakelockTimeout") // Released after request completion or foreground service stop.
@@ -48,6 +56,7 @@ public final class BackgroundGuard {
 
   public synchronized void close() {
     closed = true;
+    handler.removeCallbacks(idleRelease);
     requests = 0;
     releaseLock();
   }
